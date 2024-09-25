@@ -95,6 +95,7 @@ struct conf_load {
 	bool			btf_gen_floats;
 	bool			btf_encode;
 	bool			btf_encode_force;
+	bool			btf_encode_verbose;
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
@@ -104,6 +105,7 @@ struct conf_load {
 	const char		*kabi_prefix;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
+	int   	    (*preload_elf)(struct conf_load *conf, Elf *elf, const char *filename);
 	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
 	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
 };

@@ -3723,6 +3723,8 @@ static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 				Dwarf_Addr base __maybe_unused,
 				void *arg)
 {
+	int err = DWARF_CB_OK;
+
 	struct process_dwflmod_parms *parms = arg;
 	struct cus *cus = parms->cus;
 
@@ -3736,10 +3738,16 @@ static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 	 */
 	Elf *elf = dwfl_module_getelf(dwflmod, &dwflbias);
 
+	if (parms->conf->preload_elf) {
+		err = parms->conf->preload_elf(parms->conf, elf, parms->filename);
+		if (err) {
+			return err;
+		}
+	}
+
 	Dwarf_Addr dwbias;
 	Dwarf *dw = dwfl_module_getdwarf(dwflmod, &dwbias);
 
-	int err = DWARF_CB_OK;
 	if (dw != NULL) {
 		++parms->nr_dwarf_sections_found;
 		err = cus__load_module(cus, parms->conf, dwflmod, dw, elf,

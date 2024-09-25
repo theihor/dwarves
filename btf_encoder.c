@@ -71,6 +71,26 @@ struct var_info {
 	uint32_t    sz;
 };
 
+
+static struct {
+	struct elf_symtab *symtab;
+	struct conf_load *conf;
+	struct {
+		struct var_info *array;
+		int cnt;
+		uint32_t shndx;
+		uint64_t base_addr;
+		uint64_t sec_sz;
+		bool is_rel;
+	} percpu_variables;
+	struct {
+		struct elf_function *array;
+		int cnt;
+		int suffix_cnt; /* number of .isra, .part etc */
+	} functions;
+} elf_symbols;
+
+
 /*
  * cu: cu being processed.
  */
@@ -1016,54 +1036,38 @@ static int functions_cmp(const void *_a, const void *_b)
 #define max(x, y) ((x) < (y) ? (y) : (x))
 #endif
 
-static void *reallocarray_grow(void *ptr, int *nmemb, size_t size)
-{
-	int new_nmemb = max(1000, *nmemb * 3 / 2);
-	void *new = realloc(ptr, new_nmemb * size);
-
-	if (new)
-		*nmemb = new_nmemb;
-	return new;
-}
-
 static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *sym)
 {
-	struct elf_function *new;
 	const char *name;
 
 	if (elf_sym__type(sym) != STT_FUNC)
 		return 0;
+	
 	name = elf_sym__name(sym, encoder->symtab);
 	if (!name)
 		return 0;
 
-	if (encoder->functions.cnt == encoder->functions.allocated) {
-		new = reallocarray_grow(encoder->functions.entries,
-					&encoder->functions.allocated,
-					sizeof(*encoder->functions.entries));
-		if (!new) {
-			/*
-			 * The cleanup - delete_functions is called
-			 * in btf_encoder__encode_cu error path.
-			 */
-			return -1;
+	struct elf_function func = {
+		.name = name,
+		.generated = false,
+		.prefixlen = 0,
+		.function = NULL,
+		.state = {
+			.got_proto = false,
+			.proto = {0},
+			.type_id_off = 0
 		}
-		encoder->functions.entries = new;
-	}
+	};
 
-	encoder->functions.entries[encoder->functions.cnt].name = name;
 	if (strchr(name, '.')) {
 		const char *suffix = strchr(name, '.');
-
 		encoder->functions.suffix_cnt++;
-		encoder->functions.entries[encoder->functions.cnt].prefixlen = suffix - name;
+		func.prefixlen = suffix - name;
 	}
-	encoder->functions.entries[encoder->functions.cnt].generated = false;
-	encoder->functions.entries[encoder->functions.cnt].function = NULL;
-	encoder->functions.entries[encoder->functions.cnt].state.got_proto = false;
-	encoder->functions.entries[encoder->functions.cnt].state.proto[0] = '\0';
-	encoder->functions.entries[encoder->functions.cnt].state.type_id_off = 0;
+
+	encoder->functions.entries[encoder->functions.cnt] = func;
 	encoder->functions.cnt++;
+	
 	return 0;
 }
 
@@ -1732,6 +1736,13 @@ out:
 	return err;
 }
 
+static inline uint64_t rdtsc(void) {
+    unsigned int lo, hi;
+    asm volatile ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+
 int btf_encoder__encode(struct btf_encoder *encoder)
 {
 	bool should_tag_kfuncs;
@@ -1756,10 +1767,16 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 		return -1;
 	}
 
+	uint64_t start_time = rdtsc();
+
 	if (btf__dedup(encoder->btf, NULL)) {
 		fprintf(stderr, "%s: btf__dedup failed!\n", __func__);
 		return -1;
 	}
+
+	uint64_t end_time = rdtsc();
+	printf("BTF dedup time: %lu cycles\n", end_time - start_time);
+
 	if (encoder->raw_output) {
 		err = btf_encoder__write_raw_file(encoder);
 	} else {
@@ -1851,25 +1868,40 @@ static int btf_encoder__collect_percpu_var(struct btf_encoder *encoder, GElf_Sym
 	if (!encoder->is_rel)
 		addr -= encoder->percpu.base_addr;
 
-	if (encoder->percpu.var_cnt == encoder->percpu.allocated) {
-		struct var_info *new;
+	struct var_info var = {
+		.addr = addr,
+		.sz = size,
+		.name = sym_name
+	};
 
-		new = reallocarray_grow(encoder->percpu.vars,
-					&encoder->percpu.allocated,
-					sizeof(*encoder->percpu.vars));
-		if (!new) {
-			fprintf(stderr, "Failed to allocate memory for variables\n");
-			return -1;
-		}
-		encoder->percpu.vars = new;
-	}
-	encoder->percpu.vars[encoder->percpu.var_cnt].addr = addr;
-	encoder->percpu.vars[encoder->percpu.var_cnt].sz = size;
-	encoder->percpu.vars[encoder->percpu.var_cnt].name = sym_name;
+	encoder->percpu.vars[encoder->percpu.var_cnt] = var;
 	encoder->percpu.var_cnt++;
 
 	return 0;
 }
+
+
+static int btf_encoder__init_symbols(struct btf_encoder *encoder)
+{
+	// We overallocate to avoid unnecesarily reallocs while the table grows
+	// We know the total number of symbols in advance
+	uint32_t nr_symbols = elf_symtab__nr_symbols(encoder->symtab);
+	encoder->functions.entries = malloc(nr_symbols * sizeof(struct elf_function));
+	encoder->functions.allocated = nr_symbols;
+	encoder->functions.cnt = 0;
+
+	encoder->percpu.vars = malloc(nr_symbols * sizeof(struct var_info));
+	encoder->percpu.allocated = nr_symbols;
+	encoder->percpu.var_cnt = 0;
+
+	if (!encoder->functions.entries || !encoder->percpu.vars) {
+		fprintf(stderr, "Failed to allocate memory in btf_encoder__init_symbols\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 
 static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collect_percpu_vars)
 {
@@ -1877,8 +1909,7 @@ static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collec
 	uint32_t core_id;
 	GElf_Sym sym;
 
-	/* cache variables' addresses, preparing for searching in symtab. */
-	encoder->percpu.var_cnt = 0;
+	btf_encoder__init_symbols(encoder);
 
 	/* search within symtab for percpu variables */
 	elf_symtab__for_each_symbol_index(encoder->symtab, core_id, sym, sym_sec_idx) {
@@ -1905,6 +1936,170 @@ static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collec
 
 	return 0;
 }
+
+
+static int elf_symbols__collect_function(GElf_Sym *sym)
+{
+	const char *name;
+
+	if (elf_sym__type(sym) != STT_FUNC)
+		return 0;
+	
+	name = elf_sym__name(sym, elf_symbols.symtab);
+	if (!name)
+		return 0;
+
+	struct elf_function func = {
+		.name = name,
+		.generated = false,
+		.prefixlen = 0,
+		.function = NULL,
+		.state = {
+			.got_proto = false,
+			.proto = {0},
+			.type_id_off = 0
+		}
+	};
+
+	if (strchr(name, '.')) {
+		const char *suffix = strchr(name, '.');
+		elf_symbols.functions.suffix_cnt++;
+		func.prefixlen = suffix - name;
+	}
+
+	elf_symbols.functions.array[elf_symbols.functions.cnt] = func;
+	elf_symbols.functions.cnt++;
+	
+	return 0;
+}
+
+
+
+static int elf_symbols__collect_percpu_var(GElf_Sym *sym, size_t sym_sec_idx)
+{
+	const char *sym_name;
+	uint64_t addr;
+	uint32_t size;
+
+	/* compare a symbol's shndx to determine if it's a percpu variable */
+	if (sym_sec_idx != elf_symbols.percpu_variables.shndx)
+		return 0;
+	if (elf_sym__type(sym) != STT_OBJECT)
+		return 0;
+
+	addr = elf_sym__value(sym);
+
+	size = elf_sym__size(sym);
+	if (!size)
+		return 0; /* ignore zero-sized symbols */
+
+	sym_name = elf_sym__name(sym, elf_symbols.symtab);
+	if (!btf_name_valid(sym_name)) {
+		dump_invalid_symbol("Found symbol of invalid name when encoding btf",
+							sym_name, 
+							elf_symbols.conf->btf_encode_verbose, 
+							elf_symbols.conf->btf_encode_force);
+		if (elf_symbols.conf->btf_encode_force)
+			return 0;
+		return -1;
+	}
+
+	if (elf_symbols.conf->btf_encode_verbose)
+		printf("Found per-CPU symbol '%s' at address 0x%" PRIx64 "\n", sym_name, addr);
+
+	/* Make sure addr is section-relative. For kernel modules (which are
+	 * ET_REL files) this is already the case. For vmlinux (which is an
+	 * ET_EXEC file) we need to subtract the section address.
+	 */
+	if (!elf_symbols.percpu_variables.is_rel)
+		addr -= elf_symbols.percpu_variables.base_addr;
+
+	struct var_info var = {
+		.addr = addr,
+		.sz = size,
+		.name = sym_name
+	};
+
+	elf_symbols.percpu_variables.array[elf_symbols.percpu_variables.cnt] = var;
+	elf_symbols.percpu_variables.cnt++;
+
+	return 0;
+}
+
+
+int collect_elf_symbols(struct conf_load *conf, Elf *elf, const char *filename) {
+	elf_symbols.conf = conf;
+	elf_symbols.symtab = elf_symtab__new(NULL, elf);
+
+	uint32_t nr_symbols = elf_symtab__nr_symbols(elf_symbols.symtab);
+	elf_symbols.functions.array = malloc(nr_symbols * sizeof(struct elf_function));
+	elf_symbols.functions.cnt = 0;
+
+	elf_symbols.percpu_variables.array = malloc(nr_symbols * sizeof(struct var_info));
+	elf_symbols.percpu_variables.cnt = 0;
+
+	if (!elf_symbols.functions.array || !elf_symbols.percpu_variables.array) {
+		fprintf(stderr, "Failed to allocate memory in collect_elf_symbols\n");
+		return -1;
+	}
+
+	bool collect_vars = !conf->skip_encoding_btf_vars;
+
+	GElf_Ehdr ehdr;
+	if (gelf_getehdr(elf, &ehdr) == NULL) {
+		if (conf->btf_encode_verbose)
+			elf_error("cannot get ELF header");
+		return -1;
+	}
+	elf_symbols.percpu_variables.is_rel = ehdr.e_type == ET_REL;
+
+	GElf_Shdr shdr;
+	Elf_Scn *sec = elf_section_by_name(elf, &shdr, PERCPU_SECTION, NULL);
+	if (!sec) {
+		if (conf->btf_encode_verbose)
+			printf("%s: '%s' doesn't have '%s' section\n", __func__, filename, PERCPU_SECTION);
+	} else {
+		elf_symbols.percpu_variables.shndx = elf_ndxscn(sec);
+		elf_symbols.percpu_variables.base_addr = shdr.sh_addr;
+		elf_symbols.percpu_variables.sec_sz = shdr.sh_size;
+	}
+
+	Elf32_Word sym_sec_idx;
+	uint32_t core_id;
+	GElf_Sym sym;
+
+	/* search within symtab for percpu variables */
+	elf_symtab__for_each_symbol_index(elf_symbols.symtab, core_id, sym, sym_sec_idx) {
+		if (collect_vars) {
+			if (elf_symbols__collect_percpu_var(&sym, sym_sec_idx))
+				return -1;
+		}
+		if (elf_symbols__collect_function(&sym))
+			return -1;
+	}
+
+	// Reallocate to the exact size
+	elf_symbols.functions.array = realloc(elf_symbols.functions.array, elf_symbols.functions.cnt * sizeof(struct elf_function));
+	elf_symbols.percpu_variables.array = realloc(elf_symbols.percpu_variables.array, elf_symbols.percpu_variables.cnt * sizeof(struct var_info));
+
+	
+	if (collect_vars && elf_symbols.percpu_variables.cnt) {
+		qsort(elf_symbols.percpu_variables.array, elf_symbols.percpu_variables.cnt, sizeof(elf_symbols.percpu_variables.array[0]), percpu_var_cmp);
+		if (elf_symbols.conf->btf_encode_verbose)
+			printf("Found %d per-CPU variables!\n", elf_symbols.percpu_variables.cnt);
+	}
+
+	if (elf_symbols.functions.cnt) {
+		qsort(elf_symbols.functions.array, elf_symbols.functions.cnt, sizeof(elf_symbols.functions.array[0]), functions_cmp);
+		if (elf_symbols.conf->btf_encode_verbose)
+			printf("Found %d functions!\n", elf_symbols.functions.cnt);
+	}
+
+	return 0;
+
+}
+
+
 
 static bool ftype__has_arg_names(const struct ftype *ftype)
 {

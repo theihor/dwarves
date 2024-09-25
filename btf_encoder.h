@@ -27,4 +27,6 @@ struct btf *btf_encoder__btf(struct btf_encoder *encoder);
 
 int btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other);
 
+int collect_elf_symbols(struct conf_load *conf, Elf *elf, const char *filename);
+
 #endif /* _BTF_ENCODER_H_ */

@@ -1931,7 +1931,9 @@ static error_t pahole__options_parser(int key, char *arg,
 		  formatter = NULL;			break;
 	case 't': separator = arg[0];			break;
 	case 'u': defined_in = 1;			break;
-	case 'V': global_verbose = 1;
+	case 'V':
+		  global_verbose = 1;
+		  conf_load.btf_encode_verbose = 1;
 		  libbpf_set_print(libbpf_print_all_levels);
 		  break;
 	case 'w': word_size = atoi(arg);		break;
@@ -3707,8 +3709,20 @@ static int cus__flush_reproducible_build(struct cus *cus, struct btf_encoder *en
 	return err;
 }
 
+
+
+#include <sys/resource.h>
+
+static inline uint64_t rdtsc(void) {
+    unsigned int lo, hi;
+    asm volatile ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 int main(int argc, char *argv[])
 {
+	uint64_t start_time = rdtsc();
+	
 	int err, remaining, rc = EXIT_FAILURE;
 
 	if (argp_parse(&pahole__argp, argc, argv, 0, &remaining, NULL)) {
@@ -3797,6 +3811,10 @@ int main(int argc, char *argv[])
 
 	conf_load.thread_exit = pahole_thread_exit;
 
+	if (conf_load.btf_encode) {
+		conf_load.preload_elf = collect_elf_symbols;
+	}
+
 	if (conf_load.reproducible_build) {
 		conf_load.threads_prepare = pahole_threads_prepare_reproducible_build;
 		conf_load.threads_collect = NULL;
@@ -3832,6 +3850,13 @@ try_sole_arg_as_class_names:
 		}
 	}
 
+
+	struct rusage usage;
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+	{
+		fprintf(stdout, "\nBefore cus__load_files: %ld KB\n", usage.ru_maxrss);
+	}
+
 	err = cus__load_files(cus, &conf_load, argv + remaining);
 	if (err != 0) {
 		if (class_name == NULL && !conf_load.btf_encode && !ctf_encode) {
@@ -3852,6 +3877,11 @@ try_sole_arg_as_class_names:
 		}
 		cus__fprintf_load_files_err(cus, "pahole", argv + remaining, err, stderr);
 		goto out_cus_delete;
+	}
+
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+	{
+		fprintf(stdout, "After cus__load_files: %ld KB\n", usage.ru_maxrss);
 	}
 
 	if (sort_output && formatter == class_formatter) {
@@ -3933,5 +3963,9 @@ out:
 #ifdef DEBUG_CHECK_LEAKS
 	prototypes__delete(&class_names);
 #endif
+
+	uint64_t end_time = rdtsc();
+	printf("Total time: %lu cycles\n", end_time - start_time);
+
 	return rc;
 }
