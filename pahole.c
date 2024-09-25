@@ -32,7 +32,6 @@
 static struct btf_encoder *btf_encoder;
 static char *detached_btf_filename;
 struct cus *cus;
-static bool btf_encode;
 static bool ctf_encode;
 static bool sort_output;
 static bool need_resort;
@@ -1903,7 +1902,8 @@ static error_t pahole__options_parser(int key, char *arg,
 							break;
 	case ARGP_btf_encode_detached:
 		  detached_btf_filename = arg; // fallthru
-	case 'J': btf_encode = 1;
+	case 'J':
+		  conf_load.btf_encode = true;
 		  conf_load.get_addr_info = true;
 		  conf_load.ignore_alignment_attr = true;
 		  // XXX for now, test this more thoroughly
@@ -3301,7 +3301,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 	    print_enumeration_with_enumerator(cu, enumerator_name))
 		return LSK__DELETE; // Maybe we can find this in several CUs, so don't stop it
 
-	if (btf_encode) {
+	if (conf_load->btf_encode) {
 		static pthread_mutex_t btf_lock = PTHREAD_MUTEX_INITIALIZER;
 		struct btf_encoder *encoder;
 
@@ -3776,7 +3776,7 @@ int main(int argc, char *argv[])
 				base_btf_file, libbpf_get_error(conf_load.base_btf));
 			goto out;
 		}
-		if (!btf_encode && !ctf_encode) {
+		if (!conf_load.btf_encode && !ctf_encode) {
 			// Force "btf" since a btf_base is being informed
 			conf_load.format_path = "btf";
 		}
@@ -3834,7 +3834,7 @@ try_sole_arg_as_class_names:
 
 	err = cus__load_files(cus, &conf_load, argv + remaining);
 	if (err != 0) {
-		if (class_name == NULL && !btf_encode && !ctf_encode) {
+		if (class_name == NULL && !conf_load.btf_encode && !ctf_encode) {
 			class_name = argv[remaining];
 
 			if (class_name == NULL) {
@@ -3896,7 +3896,7 @@ try_sole_arg_as_class_names:
 	type_instance__delete(header);
 	header = NULL;
 
-	if (btf_encode && btf_encoder) { // maybe all CUs were filtered out and thus we don't have an encoder?
+	if (conf_load.btf_encode && btf_encoder) { // maybe all CUs were filtered out and thus we don't have an encoder?
 		if (conf_load.reproducible_build &&
 		    cus__flush_reproducible_build(cus, btf_encoder, &conf_load) < 0) {
 			fprintf(stderr, "Encountered error while encoding BTF.\n");
