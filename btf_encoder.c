@@ -147,16 +147,17 @@ static void btf_encoders__add(struct btf_encoder *encoder)
 	// printf("count: %d\n", gobuffer__nr_entries(&encoders));
 }
 
-// static int btf_encoder__cmp(const void *a, const void *b)
-// {
-// 	const struct btf_encoder *encoder_a = *(struct btf_encoder **)a;
-// 	const struct btf_encoder *encoder_b = *(struct btf_encoder **)b;
-// 	return strcmp(encoder_a->cu_name, encoder_b->cu_name);
-// }
-
-void btf_encoders__merge(struct btf_encoder *base_encoder)
+static int btf_encoder__cmp(const void *a, const void *b)
 {
-	// gobuffer__sort(&encoders, sizeof(void*), btf_encoder__cmp);
+	const struct btf_encoder *encoder_a = *(struct btf_encoder **)a;
+	const struct btf_encoder *encoder_b = *(struct btf_encoder **)b;
+	return strcmp(encoder_a->cu_name, encoder_b->cu_name);
+}
+
+int btf_encoders__merge(struct btf_encoder *base_encoder)
+{
+	int err = 0;
+	gobuffer__sort(&encoders, sizeof(void*), btf_encoder__cmp);
 	
 	struct btf_encoder **array = (struct btf_encoder **)encoders.entries;
 	for (int i = 0; i < gobuffer__nr_entries(&encoders); i++) {
@@ -164,10 +165,13 @@ void btf_encoders__merge(struct btf_encoder *base_encoder)
 		// printf("%s\n", encoder->cu_name);
 		if (encoder == base_encoder)
 			continue;
-		btf_encoder__add_encoder(base_encoder, encoder);
+		err = btf_encoder__add_encoder(base_encoder, encoder);
+		if (err)
+			return err;
 		btf_encoder__delete(encoder);
 	}
 	__gobuffer__delete(&encoders);
+	return err;
 }
 
 #define PERCPU_SECTION ".data..percpu"
@@ -2313,8 +2317,6 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	if (!err)
 		err = encoder->cu->functions_saved > 0 ? LSK__KEEPIT : LSK__DELETE;
 
-
-	printf("%s %s\n", cu->name, err == LSK__KEEPIT ? "KEEP" : "DELETE");
 out:
 	encoder->cu = NULL;
 	return err;

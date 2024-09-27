@@ -3236,16 +3236,16 @@ static int pahole_threads_prepare_reproducible_build(struct conf_load *conf, int
 	return 0;
 }
 
-static int pahole_threads_prepare(struct conf_load *conf, int nr_threads, void **thr_data)
-{
-	int i;
-	struct thread_data *threads = calloc(sizeof(struct thread_data), nr_threads);
+// static int pahole_threads_prepare(struct conf_load *conf, int nr_threads, void **thr_data)
+// {
+// 	int i;
+// 	struct thread_data *threads = calloc(sizeof(struct thread_data), nr_threads);
 
-	for (i = 0; i < nr_threads; i++)
-		thr_data[i] = threads + i;
+// 	for (i = 0; i < nr_threads; i++)
+// 		thr_data[i] = threads + i;
 
-	return 0;
-}
+// 	return 0;
+// }
 
 static int pahole_thread_exit(struct conf_load *conf, void *thr_data)
 {
@@ -3265,23 +3265,14 @@ static int pahole_thread_exit(struct conf_load *conf, void *thr_data)
 static int pahole_threads_collect(struct conf_load *conf, int nr_threads, void **thr_data,
 				  int error)
 {
-	struct thread_data **threads = (struct thread_data **)thr_data;
-	int i;
 	int err = 0;
 
 	if (error)
 		goto out;
 
-	btf_encoders__merge(btf_encoder);
+	err = btf_encoders__merge(btf_encoder);
 
 out:
-	for (i = 0; i < nr_threads; i++) {
-		if (threads[i]->encoder && threads[i]->encoder != btf_encoder) {
-			btf_encoder__delete(threads[i]->encoder);
-			threads[i]->encoder = NULL;
-		}
-	}
-	free(threads[0]);
 
 	return err;
 }
@@ -3739,13 +3730,8 @@ int main(int argc, char *argv[])
 		conf_load.preload_elf = preload_elf_for_btf_encoding;
 	}
 
-	if (conf_load.reproducible_build) {
-		conf_load.threads_prepare = pahole_threads_prepare_reproducible_build;
-		conf_load.threads_collect = NULL;
-	} else {
-		conf_load.threads_prepare = pahole_threads_prepare;
-		conf_load.threads_collect = pahole_threads_collect;
-	}
+	conf_load.threads_prepare = pahole_threads_prepare_reproducible_build;
+	conf_load.threads_collect = pahole_threads_collect;
 
 	// Make 'pahole --header type < file' a shorter form of 'pahole -C type --count 1 < file'
 	if (conf.header_type && !class_name && prettify_input) {
