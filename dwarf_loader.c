@@ -3185,6 +3185,7 @@ static int cu__finalize(struct cu *cu, struct cus *cus, struct conf_load *conf, 
 	cus__set_cu_state(cus, cu, CU__LOADED);
 
 	if (conf && conf->steal) {
+		// printf("%s\n", cu->name);
 		return conf->steal(cu, conf, thr_data);
 	}
 	return LSK__KEEPIT;
@@ -3410,18 +3411,6 @@ static int dwarf_cus__process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die,
        return DWARF_CB_OK;
 }
 
-static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die, uint8_t pointer_size)
-{
-	struct dwarf_cu *dcu = dwarf_cus__create_cu(dcus, cu_die, pointer_size);
-
-	if (dcu == NULL)
-		return DWARF_CB_ABORT;
-
-	cus__add(dcus->cus, dcu->cu);
-
-	return dwarf_cus__process_cu(dcus, cu_die, dcu->cu, NULL);
-}
-
 static int dwarf_cus__nextcu(struct dwarf_cus *dcus, struct dwarf_cu **dcu,
 			     Dwarf_Die *die_mem, Dwarf_Die **cu_die,
 			     uint8_t *pointer_size, uint8_t *offset_size)
@@ -3503,15 +3492,35 @@ static int dwarf_cus__threaded_process_cus(struct dwarf_cus *dcus)
 		memset(thread_data, 0, sizeof(void *) * dcus->conf->nr_jobs);
 	}
 
+	// If we are encoding BTF, process the first CU in the main thread first
+	// to guarantee that the base BTF encoder always owns the same CU for the same input
+	if (dcus->conf->btf_encode) {
+		uint8_t pointer_size, offset_size;
+		Dwarf_Die die_mem, *cu_die;
+		struct dwarf_cu *dcu;
+
+		if (dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size) == 0) {
+			if (cu_die) {
+				if (dwarf_cus__process_cu(dcus, cu_die, dcu->cu, dthr->data) == DWARF_CB_ABORT) {
+					dcus->error = DWARF_CB_ABORT;
+				} else {
+					dcus->error = DWARF_CB_OK;
+				}
+			}
+		}
+	}
+
 	for (i = 0; i < dcus->conf->nr_jobs; ++i) {
+
+		if (dcus->error)
+			goto out_join;
+
 		dthr[i].dcus = dcus;
 		dthr[i].data = thread_data[i];
 
 		dcus->error = pthread_create(&threads[i], NULL,
 					     dwarf_cus__process_cu_thread,
 					     &dthr[i]);
-		if (dcus->error)
-			goto out_join;
 	}
 
 	dcus->error = 0;
@@ -3535,34 +3544,9 @@ out_join:
 	return dcus->error;
 }
 
-static int __dwarf_cus__process_cus(struct dwarf_cus *dcus)
+static inline int dwarf_cus__process_cus(struct dwarf_cus *dcus)
 {
-	uint8_t pointer_size, offset_size;
-	Dwarf_Off noff;
-	size_t cuhl;
-
-	while (dwarf_nextcu(dcus->dw, dcus->off, &noff, &cuhl, NULL, &pointer_size, &offset_size) == 0) {
-		Dwarf_Die die_mem;
-		Dwarf_Die *cu_die = dwarf_offdie(dcus->dw, dcus->off + cuhl, &die_mem);
-
-		if (cu_die == NULL)
-			break;
-
-		if (dwarf_cus__create_and_process_cu(dcus, cu_die, pointer_size) == DWARF_CB_ABORT)
-			return DWARF_CB_ABORT;
-
-		dcus->off = noff;
-	}
-
-	return 0;
-}
-
-static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
-{
-	if (dcus->conf->nr_jobs > 1)
-		return dwarf_cus__threaded_process_cus(dcus);
-
-	return __dwarf_cus__process_cus(dcus);
+	return dwarf_cus__threaded_process_cus(dcus);
 }
 
 static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
@@ -3710,13 +3694,6 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	return DWARF_CB_OK;
 }
 
-struct process_dwflmod_parms {
-	struct cus	 *cus;
-	struct conf_load *conf;
-	const char	 *filename;
-	uint32_t	 nr_dwarf_sections_found;
-};
-
 static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 				void **userdata __maybe_unused,
 				const char *name __maybe_unused,
@@ -3739,7 +3716,7 @@ static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 	Elf *elf = dwfl_module_getelf(dwflmod, &dwflbias);
 
 	if (parms->conf->preload_elf) {
-		err = parms->conf->preload_elf(parms->conf, elf, parms->filename);
+		err = parms->conf->preload_elf(elf, parms);
 		if (err) {
 			return err;
 		}

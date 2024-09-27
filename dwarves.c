@@ -1168,6 +1168,11 @@ struct function *cus__find_function_at_addr(struct cus *cus, uint64_t addr, stru
 	return f;
 }
 
+struct cu *cus__first_cu(struct cus *cus)
+{
+	return list_first_entry(&cus->cus, struct cu, node);
+}
+
 static struct cu *__cus__find_cu_by_name(struct cus *cus, const char *name)
 {
 	struct cu *pos;
