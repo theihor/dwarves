@@ -53,6 +53,7 @@ struct btf_id_set8 {
 /* state used to do later encoding of saved functions */
 struct btf_encoder_state {
 	uint32_t type_id_off;
+	uint32_t cu_id;
 	bool got_proto;
 	char proto[BTF_ENCODER_MAX_PROTO];
 };
@@ -103,8 +104,8 @@ struct btf_encoder {
 	struct gobuffer   percpu_secinfo;
 	const char	  *source_filename;
 	const char	  *filename;
-	const char    *cu_name;
 	struct elf_symtab *symtab;
+	uint32_t      cu_id;
 	uint32_t	  type_id_off;
 	bool		  has_index_type,
 			  need_index_type,
@@ -149,9 +150,9 @@ static void btf_encoders__add(struct btf_encoder *encoder)
 
 static int btf_encoder__cmp(const void *a, const void *b)
 {
-	const struct btf_encoder *encoder_a = *(struct btf_encoder **)a;
-	const struct btf_encoder *encoder_b = *(struct btf_encoder **)b;
-	return strcmp(encoder_a->cu_name, encoder_b->cu_name);
+	const struct btf_encoder *e1 = *(struct btf_encoder **)a;
+	const struct btf_encoder *e2 = *(struct btf_encoder **)b;
+	return (int)e1->cu_id - (int)e2->cu_id;
 }
 
 int btf_encoders__merge(struct btf_encoder *base_encoder)
@@ -887,9 +888,6 @@ static bool funcs__match(struct btf_encoder *encoder, struct elf_function *func,
 	if (f1->proto.tag.type == f2->proto.tag.type)
 		return true;
 
-	if (!func->state.got_proto)
-		func->state.got_proto = proto__get(f1, func->state.proto, sizeof(func->state.proto));
-
 	if (proto__get(f2, proto, sizeof(proto))) {
 		if (strcmp(func->state.proto, proto) != 0) {
 			if (encoder->verbose)
@@ -902,32 +900,53 @@ static bool funcs__match(struct btf_encoder *encoder, struct elf_function *func,
 	return true;
 }
 
+static inline void elf_function__set_function(struct elf_function *func, struct function *fn, struct btf_encoder *fn_encoder)
+{
+	func->function = fn;
+	func->state = (struct btf_encoder_state) {
+		.cu_id = fn_encoder->cu_id,
+		.type_id_off = fn_encoder->type_id_off,
+		.got_proto = proto__get(fn, func->state.proto, sizeof(func->state.proto)),
+	};
+}
+
 static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn, struct elf_function *func)
 {
 	pthread_mutex_lock(&elf_symbols.mutex);
-	fn->priv = encoder->cu;
-	if (func->function) {
-		struct function *existing = func->function;
 
-		/* If saving and we find an existing entry, we want to merge
-		 * observations across both functions, checking that the
-		 * "seen optimized parameters", "inconsistent prototype"
-		 * and "unexpected register" status is reflected in the
-		 * the func entry.
-		 * If the entry is new, record encoder state required
-		 * to add the local function later (encoder + type_id_off)
-		 * such that we can add the function later.
-		 */
-		existing->proto.optimized_parms |= fn->proto.optimized_parms;
-		existing->proto.unexpected_reg |= fn->proto.unexpected_reg;
-		if (!existing->proto.unexpected_reg && !existing->proto.inconsistent_proto &&
-		     !funcs__match(encoder, func, fn))
-			existing->proto.inconsistent_proto = 1;
-	} else {
-		func->state.type_id_off = encoder->type_id_off;
-		func->function = fn;
+	fn->priv = encoder->cu;
+
+	struct function *existing = func->function;
+	if (!existing) {
+		elf_function__set_function(func, fn, encoder);
+		encoder->cu->functions_saved++;
+		goto out;
+	}
+
+	// If saving and we find an existing entry, we want to merge
+	// observations across both functions, checking that the "seen
+	// optimized parameters", "inconsistent prototype" and
+	// "unexpected register" status is reflected in the the func
+	// entry.
+	uint8_t optimized_parms = existing->proto.optimized_parms | fn->proto.optimized_parms;
+	uint8_t unexpected_reg = existing->proto.unexpected_reg | fn->proto.unexpected_reg;
+	uint8_t inconsistent_proto = !funcs__match(encoder, func, fn);;
+
+	// Reproducible build: if the function stored in elf_function
+	// is from a CU loaded later than the current encoder's CU,
+	// then we must replace elf_function.function data with the
+	// one from this encoder's CU, to ensure we encode exactly the same
+	// function for the same ELF input.
+	if (func->state.cu_id > encoder->cu_id) {
+		elf_function__set_function(func, fn, encoder);
 		encoder->cu->functions_saved++;
 	}
+
+	func->function->proto.optimized_parms |= optimized_parms;
+	func->function->proto.unexpected_reg |= unexpected_reg;
+	func->function->proto.inconsistent_proto |= inconsistent_proto;
+
+out:
 	pthread_mutex_unlock(&elf_symbols.mutex);
 	return 0;
 }
@@ -973,18 +992,17 @@ static void btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 		 * just do not _use_ them.  Only exclude functions with
 		 * unexpected register use or multiple inconsistent prototypes.
 		 */
-		if (fn->proto.unexpected_reg || fn->proto.inconsistent_proto) {
-			if (encoder->verbose) {
-				const char *name = function__name(fn);
 
-				printf("skipping addition of '%s'(%s) due to %s\n",
-				       name, fn->alias ?: name,
-				       fn->proto.unexpected_reg ? "unexpected register used for parameter" :
-								   "multiple inconsistent function prototypes");
-			}
-		} else {
+		bool skip_function = fn->proto.unexpected_reg || (!fn->proto.optimized_parms && fn->proto.inconsistent_proto);
+
+		if(!skip_function) {
 			encoder->type_id_off = func->state.type_id_off;
 			btf_encoder__add_func(encoder, fn);
+		} else if (encoder->verbose) {
+			const char *name = function__name(fn);
+			const char *reason = fn->proto.unexpected_reg ? "unexpected register used for parameter"
+														  : "multiple inconsistent function prototypes";
+			printf("skipping addition of '%s'(%s) due to %s\n", name, fn->alias ?: name, reason);
 		}
 	}
 }
@@ -2091,7 +2109,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 
 	if (encoder) {
 		encoder->cu = cu;
-		encoder->cu_name = strdup(cu->name);
+		encoder->cu_id = cu->dcus_index;
 		encoder->elf_symbols = &elf_symbols;
 		encoder->raw_output = detached_filename != NULL;
 		encoder->source_filename = strdup(cu->filename);
@@ -2154,7 +2172,6 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	__gobuffer__delete(&encoder->percpu_secinfo);
 	zfree(&encoder->filename);
 	zfree(&encoder->source_filename);
-	zfree(&encoder->cu_name);
 	btf__free(encoder->btf);
 	encoder->btf = NULL;
 

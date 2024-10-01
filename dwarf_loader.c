@@ -3442,6 +3442,7 @@ static int dwarf_cus__nextcu(struct dwarf_cus *dcus, struct dwarf_cu **dcu,
 		}
 		// Do it here to keep all CUs in cus->cus in the same
 		// order as in the DWARF file being loaded (e.g. vmlinux)
+		(*dcu)->cu->dcus_index = cus__nr_entries(dcus->cus);
 		__cus__add(dcus->cus, (*dcu)->cu);
 	}
 

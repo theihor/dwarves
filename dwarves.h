@@ -325,6 +325,7 @@ struct cu {
 	size_t		 max_len_changed_item;
 	size_t		 function_bytes_added;
 	size_t		 function_bytes_removed;
+	uint32_t	 dcus_index;
 	int		 build_id_len;
 	unsigned char	 build_id[0];
 };
