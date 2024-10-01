@@ -163,11 +163,10 @@ int btf_encoders__merge(struct btf_encoder *base_encoder)
 	struct btf_encoder **array = (struct btf_encoder **)encoders.entries;
 	for (int i = 0; i < gobuffer__nr_entries(&encoders); i++) {
 		struct btf_encoder *encoder = array[i];
-		// printf("%s\n", encoder->cu_name);
 		if (encoder == base_encoder)
 			continue;
 		err = btf_encoder__add_encoder(base_encoder, encoder);
-		if (err)
+		if (err < 0)
 			return err;
 		btf_encoder__delete(encoder);
 	}
@@ -2109,7 +2108,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 
 	if (encoder) {
 		encoder->cu = cu;
-		encoder->cu_id = cu->dcus_index;
+		encoder->cu_id = cu->id;
 		encoder->elf_symbols = &elf_symbols;
 		encoder->raw_output = detached_filename != NULL;
 		encoder->source_filename = strdup(cu->filename);
@@ -2333,7 +2332,6 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	 */
 	if (!err)
 		err = encoder->cu->functions_saved > 0 ? LSK__KEEPIT : LSK__DELETE;
-
 out:
 	encoder->cu = NULL;
 	return err;

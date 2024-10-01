@@ -3366,6 +3366,7 @@ struct dwarf_cus {
 	int		    build_id_len;
 	int		    error;
 	struct dwarf_cu	    *type_dcu;
+	uint32_t nextcu_counter;
 };
 
 struct dwarf_thread {
@@ -3442,7 +3443,8 @@ static int dwarf_cus__nextcu(struct dwarf_cus *dcus, struct dwarf_cu **dcu,
 		}
 		// Do it here to keep all CUs in cus->cus in the same
 		// order as in the DWARF file being loaded (e.g. vmlinux)
-		(*dcu)->cu->dcus_index = cus__nr_entries(dcus->cus);
+		(*dcu)->cu->id = dcus->nextcu_counter;
+		dcus->nextcu_counter++;
 		__cus__add(dcus->cus, (*dcu)->cu);
 	}
 
@@ -3682,6 +3684,7 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 			.type_dcu = type_cu ? &type_dcu : NULL,
 			.build_id = build_id,
 			.build_id_len = build_id_len,
+			.nextcu_counter = 0,
 		};
 		res = dwarf_cus__process_cus(&dcus);
 	}
