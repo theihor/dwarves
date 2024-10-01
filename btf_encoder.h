@@ -16,8 +16,7 @@ struct btf;
 struct cu;
 struct list_head;
 
-struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool verbose, struct conf_load *conf_load);
-void btf_encoder__delete(struct btf_encoder *encoder);
+struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, struct conf_load *conf_load);
 
 int btf_encoder__encode(struct btf_encoder *encoder);
 
@@ -26,5 +25,8 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 struct btf *btf_encoder__btf(struct btf_encoder *encoder);
 
 int btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other);
+
+int elf_symbols__collect_symbols(Elf *elf, struct conf_load *conf, const char *filename);
+int btf_encoders__merge(struct btf_encoder *base_encoder);
 
 #endif /* _BTF_ENCODER_H_ */

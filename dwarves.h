@@ -36,6 +36,7 @@
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
 
 struct cu;
+struct cus;
 
 enum load_steal_kind {
 	LSK__KEEPIT,
@@ -57,6 +58,14 @@ typedef uint32_t type_id_t;
 
 struct btf;
 struct conf_fprintf;
+
+// This struct is passed to cus__process_dwflmod and preload_elf hook
+struct process_dwflmod_parms {
+	struct cus	 *cus;
+	struct conf_load *conf;
+	const char	 *filename;
+	uint32_t	 nr_dwarf_sections_found;
+};
 
 /** struct conf_load - load configuration
  * @thread_exit - called at the end of a thread, 1st user: BTF encoder dedup
@@ -93,7 +102,9 @@ struct conf_load {
 	bool			skip_encoding_btf_inconsistent_proto;
 	bool			skip_encoding_btf_vars;
 	bool			btf_gen_floats;
+	bool			btf_encode;
 	bool			btf_encode_force;
+	bool			btf_encode_verbose;
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
@@ -103,6 +114,7 @@ struct conf_load {
 	const char		*kabi_prefix;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
+	int   	    (*preload_elf)(Elf *elf, struct process_dwflmod_parms *parms);
 	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
 	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
 };
@@ -166,8 +178,6 @@ struct conf_fprintf {
 	uint8_t    skip_emitting_modifier:1;
 };
 
-struct cus;
-
 struct cus *cus__new(void);
 void cus__delete(struct cus *cus);
 
@@ -193,6 +203,7 @@ void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
 struct cu *cus__find_pair(struct cus *cus, const char *name);
+struct cu *cus__first_cu(struct cus *cus);
 struct cu *cus__find_cu_by_name(struct cus *cus, const char *name);
 struct tag *cus__find_struct_by_name(struct cus *cus, struct cu **cu,
 				     const char *name, const int include_decls,
@@ -314,6 +325,7 @@ struct cu {
 	size_t		 max_len_changed_item;
 	size_t		 function_bytes_added;
 	size_t		 function_bytes_removed;
+	uint32_t	 id;
 	int		 build_id_len;
 	unsigned char	 build_id[0];
 };
@@ -1003,7 +1015,6 @@ struct ftype {
 	uint8_t		 unspec_parms:1; /* just one bit is needed */
 	uint8_t		 optimized_parms:1;
 	uint8_t		 unexpected_reg:1;
-	uint8_t		 processed:1;
 	uint8_t		 inconsistent_proto:1;
 	struct list_head template_type_params;
 	struct list_head template_value_params;
