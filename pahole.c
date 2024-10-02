@@ -3814,6 +3814,9 @@ int main(int argc, char *argv[])
 		conf_load.threads_collect = pahole_threads_collect;
 	}
 
+	if (btf_encode)
+		conf_load.pre_load_module = btf_encoder__pre_load_module;
+
 	// Make 'pahole --header type < file' a shorter form of 'pahole -C type --count 1 < file'
 	if (conf.header_type && !class_name && prettify_input) {
 		conf.count = 1;

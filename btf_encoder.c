@@ -103,6 +103,8 @@ struct elf_secinfo {
 };
 
 struct elf_functions {
+	struct list_head node; /* for elf_functions_list */
+	Elf *elf; /* source ELF */
 	struct elf_symtab *symtab;
 	struct elf_function *entries;
 	int cnt;
@@ -146,6 +148,66 @@ struct btf_kfunc_set_range {
 	uint64_t start;
 	uint64_t end;
 };
+
+
+/* In principle, multiple ELFs can be processed in one pahole run,
+ * so we have to store elf_functions table per ELF.
+ * An element is added to the list on btf_encoder__pre_load_module,
+ * and removed after btf_encoder__encode is done.
+ */
+static LIST_HEAD(elf_functions_list);
+
+static inline void elf_functions__delete(struct elf_functions *funcs)
+{
+	free(funcs->entries);
+	elf_symtab__delete(funcs->symtab);
+	list_del(&funcs->node);
+	free(funcs);
+}
+
+static inline void elf_functions__delete_all()
+{
+	struct list_head *pos, *tmp;
+
+	list_for_each_safe(pos, tmp, &elf_functions_list) {
+		struct elf_functions *funcs = list_entry(pos, struct elf_functions, node);
+		elf_functions__delete(funcs);
+	}
+}
+
+static int elf_functions__collect(struct elf_functions *functions);
+
+int btf_encoder__pre_load_module(Dwfl_Module *mod, Elf *elf)
+{
+	struct elf_functions *funcs;
+	int err;
+
+	funcs = calloc(1, sizeof(*funcs));
+	if (!funcs) {
+		err = -ENOMEM;
+		goto out_delete;
+	}
+
+	funcs->symtab = elf_symtab__new(NULL, elf);
+	if (!funcs->symtab) {
+		err = -1;
+		goto out_delete;
+	}
+
+	funcs->elf = elf;
+	err = elf_functions__collect(funcs);
+	if (err)
+		goto out_delete;
+
+	list_add_tail(&funcs->node, &elf_functions_list);
+
+	return 0;
+
+out_delete:
+	elf_functions__delete(funcs);
+	return err;
+}
+
 
 static LIST_HEAD(encoders);
 static pthread_mutex_t encoders__lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2071,6 +2133,8 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 #endif
 		err = btf_encoder__write_elf(encoder, encoder->btf, BTF_ELF_SEC);
 	}
+
+	elf_functions__delete_all();
 	return err;
 }
 
@@ -2387,6 +2451,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 			goto out;
 		}
 		encoder->functions.symtab = encoder->symtab;
+		encoder->functions.elf = cu->elf;
 
 		/* index the ELF sections for later lookup */
 
