@@ -2178,7 +2178,7 @@ static int btf_encoder__collect_percpu_var(struct btf_encoder *encoder, GElf_Sym
 	return 0;
 }
 
-static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collect_percpu_vars)
+static int btf_encoder__collect_percpu_vars(struct btf_encoder *encoder)
 {
 	Elf32_Word sym_sec_idx;
 	uint32_t core_id;
@@ -2189,25 +2189,57 @@ static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collec
 
 	/* search within symtab for percpu variables */
 	elf_symtab__for_each_symbol_index(encoder->symtab, core_id, sym, sym_sec_idx) {
-		if (collect_percpu_vars && btf_encoder__collect_percpu_var(encoder, &sym, sym_sec_idx))
+		if (btf_encoder__collect_percpu_var(encoder, &sym, sym_sec_idx))
 			return -1;
+	}
+
+	if (encoder->percpu.var_cnt)
+		qsort(encoder->percpu.vars,
+		      encoder->percpu.var_cnt,
+		      sizeof(encoder->percpu.vars[0]),
+		      percpu_var_cmp);
+
+	if (encoder->verbose)
+		printf("Found %d per-CPU variables!\n", encoder->percpu.var_cnt);
+
+	return 0;
+}
+
+static int btf_encoder__collect_functions(struct btf_encoder *encoder)
+{
+	Elf32_Word sym_sec_idx;
+	uint32_t core_id;
+	GElf_Sym sym;
+
+	elf_symtab__for_each_symbol_index(encoder->symtab, core_id, sym, sym_sec_idx) {;
 		if (btf_encoder__collect_function(encoder, &sym))
 			return -1;
 	}
 
-	if (collect_percpu_vars) {
-		if (encoder->percpu.var_cnt)
-			qsort(encoder->percpu.vars, encoder->percpu.var_cnt, sizeof(encoder->percpu.vars[0]), percpu_var_cmp);
-
-		if (encoder->verbose)
-			printf("Found %d per-CPU variables!\n", encoder->percpu.var_cnt);
-	}
-
 	if (encoder->functions.cnt) {
-		qsort(encoder->functions.entries, encoder->functions.cnt, sizeof(encoder->functions.entries[0]),
+		qsort(encoder->functions.entries,
+		      encoder->functions.cnt,
+		      sizeof(encoder->functions.entries[0]),
 		      functions_cmp);
 		if (encoder->verbose)
 			printf("Found %d functions!\n", encoder->functions.cnt);
+	}
+
+	return 0;
+}
+
+static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collect_percpu_vars)
+{
+	int err;
+
+	err = btf_encoder__collect_functions(encoder);
+	if (err)
+		return err;
+
+	if (collect_percpu_vars) {
+		err = btf_encoder__collect_percpu_vars(encoder);
+		if (err)
+			return err;
 	}
 
 	return 0;
