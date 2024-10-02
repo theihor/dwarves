@@ -3235,7 +3235,7 @@ int preload_elf_for_btf_encoding(Elf *elf, struct process_dwflmod_parms *parms)
 	// 	btf_encoder = btf_encoder__new(cu, detached_btf_filename, parms->conf->base_btf, parms->conf);	
 	// }
 
-	return elf_symbols__collect_symbols(elf, parms->conf, parms->filename);
+	return elf_data__collect_symbols(elf, parms->conf, parms->filename);
 }
 
 struct thread_data {
