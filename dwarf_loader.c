@@ -3826,6 +3826,12 @@ static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 	Dwarf *dw = dwfl_module_getdwarf(dwflmod, &dwbias);
 
 	int err = DWARF_CB_OK;
+	if (parms->conf->pre_load_module) {
+		err = parms->conf->pre_load_module(dwflmod, elf);
+		if (err)
+			return DWARF_CB_ABORT;
+	}
+
 	if (dw != NULL) {
 		++parms->nr_dwarf_sections_found;
 		err = cus__load_module(cus, parms->conf, dwflmod, dw, elf,
