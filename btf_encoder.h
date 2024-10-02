@@ -34,4 +34,6 @@ struct btf *btf_encoder__btf(struct btf_encoder *encoder);
 
 int btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other);
 
+int btf_encoder__pre_cus__load_module(struct process_dwflmod_parms *parms, Dwfl_Module *mod, Dwarf *dw, Elf *elf);
+
 #endif /* _BTF_ENCODER_H_ */

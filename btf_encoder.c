@@ -103,6 +103,8 @@ struct elf_secinfo {
 };
 
 struct elf_functions {
+	struct list_head node; // for elf_functions_list
+	Elf *elf; // source ELF
 	struct elf_symtab *symtab;
 	struct elf_function *entries;
 	int cnt;
@@ -146,6 +148,72 @@ struct btf_kfunc_set_range {
 	uint64_t start;
 	uint64_t end;
 };
+
+
+// In principle, multiple ELFs can be processed in one pahole run,
+// so we have to store elf_functions table per ELF.
+// An element is added to the list on btf_encoder__pre_cus__load_module,
+// and removed after btf_encoder__encode is done.
+static LIST_HEAD(elf_functions_list);
+
+static struct elf_functions *elf_functions__get(Elf *elf)
+{
+	struct list_head *pos;
+
+	list_for_each(pos, &elf_functions_list) {
+		struct elf_functions *funcs = list_entry(pos, struct elf_functions, node);
+
+		if (funcs->elf == elf)
+			return funcs;
+	}
+	return NULL;
+}
+
+static inline void elf_functions__delete(struct elf_functions *funcs)
+{
+	free(funcs->entries);
+	elf_symtab__delete(funcs->symtab);
+	list_del(&funcs->node);
+	free(funcs);
+}
+
+static int elf_functions__collect(struct elf_functions *functions);
+
+static struct elf_functions *elf_functions__new(Elf *elf)
+{
+	struct elf_functions *funcs = calloc(1, sizeof(*funcs));
+
+	if (!funcs)
+		return NULL;
+	funcs->elf = elf;
+
+	funcs->symtab = elf_symtab__new(NULL, elf);
+	if (!funcs->symtab)
+		goto out_error;
+
+	int err = elf_functions__collect(funcs);
+
+	if (err)
+		goto out_error;
+
+	list_add_tail(&funcs->node, &elf_functions_list);
+	return funcs;
+
+out_error:
+	elf_functions__delete(funcs);
+	return NULL;
+}
+
+int btf_encoder__pre_cus__load_module(struct process_dwflmod_parms *parms, Dwfl_Module *mod, Dwarf *dw, Elf *elf)
+{
+	struct elf_functions *funcs = elf_functions__new(elf);
+
+	if (!funcs)
+		return -1;
+
+	return 0;
+}
+
 
 static LIST_HEAD(encoders);
 static pthread_mutex_t encoders__lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2071,6 +2139,13 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 #endif
 		err = btf_encoder__write_elf(encoder, encoder->btf, BTF_ELF_SEC);
 	}
+
+	// TODO: after moving encoders to shared elf_functions,
+	// replace elf_functions__get(encoder->functions.elf) here
+	// with encoder->functions
+	// The pointer to shared elf_functions will be set in btf_encoder__new
+	elf_functions__delete(elf_functions__get(encoder->functions.elf));
+
 	return err;
 }
 
@@ -2369,6 +2444,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 			goto out;
 		}
 		encoder->functions.symtab = encoder->symtab;
+		encoder->functions.elf = cu->elf;
 
 		/* index the ELF sections for later lookup */
 
