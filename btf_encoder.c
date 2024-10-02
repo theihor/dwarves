@@ -105,6 +105,14 @@ struct elf_secinfo {
 	uint64_t    sz;
 };
 
+struct elf_functions {
+	struct elf_symtab *symtab;
+	struct elf_function *entries;
+	int allocated;
+	int cnt;
+	int suffix_cnt;
+};
+
 /*
  * cu: cu being processed.
  */
@@ -137,12 +145,7 @@ struct btf_encoder {
 		int		allocated;
 		uint32_t	shndx;
 	} percpu;
-	struct {
-		struct elf_function *entries;
-		int		    allocated;
-		int		    cnt;
-		int		    suffix_cnt; /* number of .isra, .part etc */
-	} functions;
+	struct elf_functions functions;
 };
 
 struct btf_func {
@@ -1314,21 +1317,21 @@ static void *reallocarray_grow(void *ptr, int *nmemb, size_t size)
 	return new;
 }
 
-static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *sym)
+static int elf_functions__collect_function(struct elf_functions *functions, GElf_Sym *sym)
 {
 	struct elf_function *new;
 	const char *name;
 
 	if (elf_sym__type(sym) != STT_FUNC)
 		return 0;
-	name = elf_sym__name(sym, encoder->symtab);
+	name = elf_sym__name(sym, functions->symtab);
 	if (!name)
 		return 0;
 
-	if (encoder->functions.cnt == encoder->functions.allocated) {
-		new = reallocarray_grow(encoder->functions.entries,
-					&encoder->functions.allocated,
-					sizeof(*encoder->functions.entries));
+	if (functions->cnt == functions->allocated) {
+		new = reallocarray_grow(functions->entries,
+					&functions->allocated,
+					sizeof(*functions->entries));
 		if (!new) {
 			/*
 			 * The cleanup - delete_functions is called
@@ -1336,19 +1339,20 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 			 */
 			return -1;
 		}
-		encoder->functions.entries = new;
+		functions->entries = new;
 	}
 
-	memset(&encoder->functions.entries[encoder->functions.cnt], 0,
-	       sizeof(*new));
-	encoder->functions.entries[encoder->functions.cnt].name = name;
+	struct elf_function *func = &functions->entries[functions->cnt];
+
+	memset(func, 0, sizeof(*func));
+	func->name = name;
 	if (strchr(name, '.')) {
 		const char *suffix = strchr(name, '.');
-
-		encoder->functions.suffix_cnt++;
-		encoder->functions.entries[encoder->functions.cnt].prefixlen = suffix - name;
+		functions->suffix_cnt++;
+		func->prefixlen = suffix - name;
 	}
-	encoder->functions.cnt++;
+	functions->cnt++;
+
 	return 0;
 }
 
@@ -2205,25 +2209,22 @@ static int btf_encoder__collect_percpu_vars(struct btf_encoder *encoder)
 	return 0;
 }
 
-static int btf_encoder__collect_functions(struct btf_encoder *encoder)
+static int elf_functions__collect(struct elf_functions *functions)
 {
 	Elf32_Word sym_sec_idx;
 	uint32_t core_id;
 	GElf_Sym sym;
 
-	elf_symtab__for_each_symbol_index(encoder->symtab, core_id, sym, sym_sec_idx) {;
-		if (btf_encoder__collect_function(encoder, &sym))
+	elf_symtab__for_each_symbol_index(functions->symtab, core_id, sym, sym_sec_idx) {;
+		if (elf_functions__collect_function(functions, &sym))
 			return -1;
 	}
 
-	if (encoder->functions.cnt) {
-		qsort(encoder->functions.entries,
-		      encoder->functions.cnt,
-		      sizeof(encoder->functions.entries[0]),
+	if (functions->cnt)
+		qsort(functions->entries,
+		      functions->cnt,
+		      sizeof(functions->entries[0]),
 		      functions_cmp);
-		if (encoder->verbose)
-			printf("Found %d functions!\n", encoder->functions.cnt);
-	}
 
 	return 0;
 }
@@ -2232,9 +2233,11 @@ static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collec
 {
 	int err;
 
-	err = btf_encoder__collect_functions(encoder);
+	err = elf_functions__collect(&encoder->functions);
 	if (err)
 		return err;
+	if (encoder->verbose)
+		printf("Found %d functions!\n", encoder->functions.cnt);
 
 	if (collect_percpu_vars) {
 		err = btf_encoder__collect_percpu_vars(encoder);
@@ -2438,6 +2441,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 				printf("%s: '%s' doesn't have symtab.\n", __func__, cu->filename);
 			goto out;
 		}
+		encoder->functions.symtab = encoder->symtab;
 
 		/* index the ELF sections for later lookup */
 
