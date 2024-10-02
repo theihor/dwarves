@@ -3723,13 +3723,6 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	return DWARF_CB_OK;
 }
 
-struct process_dwflmod_parms {
-	struct cus	 *cus;
-	struct conf_load *conf;
-	const char	 *filename;
-	uint32_t	 nr_dwarf_sections_found;
-};
-
 static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 				void **userdata __maybe_unused,
 				const char *name __maybe_unused,
@@ -3753,10 +3746,24 @@ static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 	Dwarf *dw = dwfl_module_getdwarf(dwflmod, &dwbias);
 
 	int err = DWARF_CB_OK;
+	if (parms->conf->pre_cus__load_module) {
+		err = parms->conf->pre_cus__load_module(parms, dwflmod, dw, elf);
+		if (err)
+			return DWARF_CB_ABORT;
+	}
+
 	if (dw != NULL) {
 		++parms->nr_dwarf_sections_found;
 		err = cus__load_module(cus, parms->conf, dwflmod, dw, elf,
 				       parms->filename);
+		if (err)
+			return err;
+	}
+
+	if (parms->conf->post_cus__load_module) {
+		err = parms->conf->post_cus__load_module(parms, dwflmod, dw, elf);
+		if (err)
+			return DWARF_CB_ABORT;
 	}
 	/*
 	 * XXX We will fall back to try finding other debugging
