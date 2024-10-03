@@ -111,6 +111,7 @@ struct elf_functions_entry {
 	const char *name;
 	size_t prefixlen;
 	struct elf_function *funcs; // list of elf_function
+	pthread_mutex_t mutex;
 };
 
 struct elf_functions {
@@ -155,7 +156,7 @@ struct btf_encoder {
 		int		allocated;
 		uint32_t	shndx;
 	} percpu;
-	struct elf_functions functions;
+	struct elf_functions *functions;
 };
 
 struct btf_func {
@@ -258,8 +259,6 @@ int btf_encoder__pre_cus__load_module(struct process_dwflmod_parms *parms, Dwfl_
 
 static LIST_HEAD(encoders);
 static pthread_mutex_t encoders__lock = PTHREAD_MUTEX_INITIALIZER;
-
-static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder);
 
 /* mutex only needed for add/delete, as this can happen in multiple encoding
  * threads.  Traversal of the list is currently confined to thread collection.
@@ -906,7 +905,7 @@ static int32_t btf_encoder__add_var_secinfo(struct btf_encoder *encoder, uint32_
 	return gobuffer__add(&encoder->percpu_secinfo, &si, sizeof(si));
 }
 
-int32_t btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other)
+static int32_t btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other)
 {
 	struct gobuffer *var_secinfo_buf = &other->percpu_secinfo;
 	size_t sz = gobuffer__size(var_secinfo_buf);
@@ -919,8 +918,6 @@ int32_t btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder
 	if (encoder == other)
 		return 0;
 
-	btf_encoder__add_saved_funcs(other);
-
 	for (i = 0; i < nr_var_secinfo; i++) {
 		vsi = (struct btf_var_secinfo *)var_secinfo_buf->entries + i;
 		type_id = next_type_id + vsi->type - 1; /* Type ID starts from 1 */
@@ -930,6 +927,25 @@ int32_t btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder
 	}
 
 	return btf__add_btf(encoder->btf, other->btf);
+}
+
+int btf_encoder__merge_encoders(struct btf_encoder *base_encoder, struct btf_encoder **encoders, int nr_encoders)
+{
+	int err;
+
+	err = btf_encoder__add_saved_funcs(base_encoder);
+	if (err < 0)
+		return err;
+
+	for (int i = 0; i < nr_encoders; i++) {
+		if (base_encoder == encoders[i])
+			continue;
+		err = btf_encoder__add_encoder(base_encoder, encoders[i]);
+		if (err < 0)
+			return err;
+	}
+
+	return 0;
 }
 
 static int32_t btf_encoder__add_datasec(struct btf_encoder *encoder, const char *section_name)
@@ -997,7 +1013,7 @@ static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char
 	return id;
 }
 
-static void btf_encoder__log_func_skip(struct btf_encoder *encoder, struct elf_function *func,
+static void btf_encoder__log_func_skip(const struct btf_encoder *encoder, struct elf_function *func,
 				       const char *fmt, ...)
 {
 	va_list ap;
@@ -1033,7 +1049,7 @@ static int fwd__kind(const struct btf_type *t)
 	return btf_kind(t);
 }
 
-static bool types__match(struct btf_encoder *encoder,
+static bool types__match(const struct btf_encoder *encoder,
 			 struct btf *btf1, int type_id1,
 			 struct btf *btf2, int type_id2)
 {
@@ -1132,7 +1148,7 @@ static bool types__match(struct btf_encoder *encoder,
 	return false;
 }
 
-static bool funcs__match(struct btf_encoder *encoder, struct elf_function *func,
+static bool funcs__match(const struct btf_encoder *encoder, struct elf_function *func,
 			 struct btf *btf1, struct btf_encoder_func_state *s1,
 			 struct btf *btf2, struct btf_encoder_func_state *s2)
 {
@@ -1346,44 +1362,46 @@ static inline struct elf_function *find_elf_function_in_entry(struct elf_functio
 	return NULL;
 }
 
-static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
+
+// Each elf_functions_entry contains a variable number of elf_function
+// structs, because not all encoders encountered a particular
+// function.  However each function encountered at least once needs to be
+// added to BTF _somewhere_. Here we traverse the entire elf_functions
+// table, and for each array of elf_function structs the function is
+// added to the BTF of the encoder of the first elf_function in the array.
+int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 {
-	int i;
+	struct elf_functions *functions = encoder->functions;
 
-	for (i = 0; i < encoder->functions.cnt; i++) {
-		struct elf_function *func = find_elf_function_in_entry(&encoder->functions.entries[i], encoder);
+	for (int i = 0; i < functions->cnt; i++) {
+		struct elf_functions_entry *entry = &functions->entries[i];
 
-		if (!func)
+		if (!entry->funcs)
 			continue;
 
+		struct elf_function *func = entry->funcs;
 		struct btf_encoder_func_state *state = &func->state;
-		struct btf_encoder *other_encoder = NULL;
 
 		if (!state->initialized || state->processed)
 			continue;
-		/* merge optimized-out status across encoders; since each
-		 * encoder has the same elf symbol table we can use the
-		 * same index to access the same elf symbol.
-		 */
-		btf_encoders__for_each_encoder(other_encoder) {
-			struct elf_function *other_func;
-			struct btf_encoder_func_state *other_state;
+
+		for_each_elf_function(other_func, entry) {
+			if (func == other_func)
+				continue;
+
+			struct btf_encoder_func_state *other_state = &other_func->state;
 			uint8_t optimized, unexpected, inconsistent;
-			other_func = find_elf_function_in_entry(&other_encoder->functions.entries[i], other_encoder);
 
-			if (other_encoder == encoder || !other_func)
+			if (!other_func || !other_state->initialized || other_state->processed)
 				continue;
 
-			other_state = &other_func->state;
-			if (!other_state->initialized)
-				continue;
 			optimized = state->optimized_parms | other_state->optimized_parms;
 			unexpected = state->unexpected_reg | other_state->unexpected_reg;
 			inconsistent = state->inconsistent_proto | other_state->inconsistent_proto;
 			if (!unexpected && !inconsistent &&
-			    !funcs__match(encoder, func,
-					  encoder->btf, state,
-					  other_encoder->btf, other_state))
+			    !funcs__match(func->owner, func,
+					  func->owner->btf, state,
+					  other_func->owner->btf, other_state))
 				inconsistent = 1;
 			state->optimized_parms = other_state->optimized_parms = optimized;
 			state->unexpected_reg = other_state->unexpected_reg = unexpected;
@@ -1397,7 +1415,7 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 		 * unexpected register use or multiple inconsistent prototypes.
 		 */
 		if (!state->unexpected_reg && !state->inconsistent_proto) {
-			if (btf_encoder__add_func(encoder, NULL, func))
+			if (btf_encoder__add_func((struct btf_encoder *)func->owner, NULL, func))
 				return -1;
 		}
 		state->processed = 1;
@@ -1466,6 +1484,7 @@ static int elf_functions__collect_function(struct elf_functions *functions, GElf
 		functions->suffix_cnt++;
 		entry->prefixlen = suffix - name;
 	}
+	pthread_mutex_init(&entry->mutex, NULL);
 	functions->cnt++;
 
 	return 0;
@@ -1477,11 +1496,12 @@ static struct elf_function *btf_encoder__find_function(const struct btf_encoder 
 	struct elf_function *func = NULL;
 	struct elf_functions_entry key = { .name = name, .prefixlen = prefixlen };
 	struct elf_functions_entry *entry = bsearch(&key,
-						    encoder->functions.entries,
-						    encoder->functions.cnt,
+						    encoder->functions->entries,
+						    encoder->functions->cnt,
 						    sizeof(key),
 						    functions_cmp);
 	if (entry) {
+		pthread_mutex_lock(&entry->mutex);
 		// If entry is found then there is a name match.
 		func = find_elf_function_in_entry(entry, encoder);
 		// However if there is no elf_function for this encoder in the entry,
@@ -1495,6 +1515,7 @@ static struct elf_function *btf_encoder__find_function(const struct btf_encoder 
 			func->next = entry->funcs;
 			entry->funcs = func;
 		}
+		pthread_mutex_unlock(&entry->mutex);
 	}
 
 	return func;
@@ -2184,9 +2205,6 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 	bool should_tag_kfuncs;
 	int err;
 
-	/* for single-threaded case, saved funcs are added here */
-	btf_encoder__add_saved_funcs(encoder);
-
 	if (gobuffer__size(&encoder->percpu_secinfo) != 0)
 		btf_encoder__add_datasec(encoder, PERCPU_SECTION);
 
@@ -2236,11 +2254,8 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 		err = btf_encoder__write_elf(encoder, encoder->btf, BTF_ELF_SEC);
 	}
 
-	// TODO: after moving encoders to shared elf_functions,
-	// replace elf_functions__get(encoder->functions.elf) here
-	// with encoder->functions
-	// The pointer to shared elf_functions will be set in btf_encoder__new
-	elf_functions__delete(elf_functions__get(encoder->functions.elf));
+	// Delete the shared elf_functions table, because we are done encoding
+	elf_functions__delete(encoder->functions);
 
 	return err;
 }
@@ -2368,25 +2383,6 @@ static int elf_functions__collect(struct elf_functions *functions)
 		      functions->cnt,
 		      sizeof(functions->entries[0]),
 		      functions_cmp);
-
-	return 0;
-}
-
-static int btf_encoder__collect_symbols(struct btf_encoder *encoder, bool collect_percpu_vars)
-{
-	int err;
-
-	err = elf_functions__collect(&encoder->functions);
-	if (err)
-		return err;
-	if (encoder->verbose)
-		printf("Found %d functions!\n", encoder->functions.cnt);
-
-	if (collect_percpu_vars) {
-		err = btf_encoder__collect_percpu_vars(encoder);
-		if (err)
-			return err;
-	}
 
 	return 0;
 }
@@ -2584,8 +2580,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 				printf("%s: '%s' doesn't have symtab.\n", __func__, cu->filename);
 			goto out;
 		}
-		encoder->functions.symtab = encoder->symtab;
-		encoder->functions.elf = cu->elf;
+		encoder->functions = elf_functions__get(cu->elf);
 
 		/* index the ELF sections for later lookup */
 
@@ -2616,8 +2611,10 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		if (!encoder->percpu.shndx && encoder->verbose)
 			printf("%s: '%s' doesn't have '%s' section\n", __func__, cu->filename, PERCPU_SECTION);
 
-		if (btf_encoder__collect_symbols(encoder, !encoder->skip_encoding_vars))
-			goto out_delete;
+		if (!encoder->skip_encoding_vars) {
+			if (btf_encoder__collect_percpu_vars(encoder))
+				goto out_delete;
+		}
 
 		if (encoder->verbose)
 			printf("File %s:\n", cu->filename);
@@ -2642,8 +2639,7 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	zfree(&encoder->source_filename);
 	btf__free(encoder->btf);
 	encoder->btf = NULL;
-
-	__elf_functions__delete(&encoder->functions);
+	elf_symtab__delete(encoder->symtab);
 
 	encoder->percpu.allocated = encoder->percpu.var_cnt = 0;
 	free(encoder->percpu.vars);
@@ -2746,7 +2742,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			continue;
 		if (!ftype__has_arg_names(&fn->proto))
 			continue;
-		if (encoder->functions.cnt) {
+		if (encoder->functions->cnt) {
 			const char *name;
 
 			name = function__name(fn);
@@ -2762,7 +2758,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 					save = true;
 				else
 					func->generated = true;
-			} else if (encoder->functions.suffix_cnt &&
+			} else if (encoder->functions->suffix_cnt &&
 				   conf_load->btf_gen_optimized) {
 				/* falling back to name.isra.0 match if no exact
 				 * match is found; only bother if we found any
