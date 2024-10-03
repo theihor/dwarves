@@ -86,10 +86,15 @@ struct btf_encoder_func_state {
 };
 
 struct elf_function {
+	// bsearch key
 	const char	*name;
-	char		*alias;
-	bool		 generated;
-	size_t		prefixlen;
+	size_t		 prefixlen;
+	// for list search
+	struct elf_function *next;
+	const struct btf_encoder *owner;
+	// encoder-specific state
+	char *alias;
+	bool generated;
 	struct btf_encoder_func_state state;
 };
 
@@ -106,7 +111,7 @@ struct elf_functions {
 	struct list_head node; // for elf_functions_list
 	Elf *elf; // source ELF
 	struct elf_symtab *symtab;
-	struct elf_function *entries;
+	struct elf_function *entries; // an array, each element is a head of a list
 	int cnt;
 	int suffix_cnt; /* number of .isra, .part etc */
 };
@@ -169,10 +174,29 @@ static struct elf_functions *elf_functions__get(Elf *elf)
 	return NULL;
 }
 
-static inline void elf_functions__delete(struct elf_functions *funcs)
+static void __elf_functions__delete(struct elf_functions *funcs)
 {
+	for (int i = 0; i < funcs->cnt; i++) {
+		// free all list elements except the head
+		struct elf_function *func = funcs->entries[i].next;
+
+		while (func) {
+			struct elf_function *next = func->next;
+
+			free(func->alias);
+			zfree(&func->state.annots);
+			zfree(&func->state.parms);
+			free(func);
+			func = next;
+		}
+	}
 	free(funcs->entries);
 	elf_symtab__delete(funcs->symtab);
+}
+
+static inline void elf_functions__delete(struct elf_functions *funcs)
+{
+	__elf_functions__delete(funcs);
 	list_del(&funcs->node);
 	free(funcs);
 }
@@ -203,6 +227,7 @@ out_error:
 	elf_functions__delete(funcs);
 	return NULL;
 }
+
 
 int btf_encoder__pre_cus__load_module(struct process_dwflmod_parms *parms, Dwfl_Module *mod, Dwarf *dw, Elf *elf)
 {
@@ -1301,12 +1326,30 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder, struct functio
 	return 0;
 }
 
+#define for_each_elf_function(func, head) \
+	for (struct elf_function *func = head; func; func = func->next)
+
+static inline struct elf_function *find_elf_function_in_list(struct elf_function *list_head,
+							     const struct btf_encoder *encoder)
+{
+	for_each_elf_function(f, list_head) {
+		if (f->owner == encoder)
+			return f;
+	}
+
+	return NULL;
+}
+
 static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 {
 	int i;
 
 	for (i = 0; i < encoder->functions.cnt; i++) {
-		struct elf_function *func = &encoder->functions.entries[i];
+		struct elf_function *func = find_elf_function_in_list(&encoder->functions.entries[i], encoder);
+
+		if (!func)
+			continue;
+
 		struct btf_encoder_func_state *state = &func->state;
 		struct btf_encoder *other_encoder = NULL;
 
@@ -1320,11 +1363,11 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 			struct elf_function *other_func;
 			struct btf_encoder_func_state *other_state;
 			uint8_t optimized, unexpected, inconsistent;
+			other_func = find_elf_function_in_list(&other_encoder->functions.entries[i], other_encoder);
 
-			if (other_encoder == encoder)
+			if (other_encoder == encoder || !other_func)
 				continue;
 
-			other_func = &other_encoder->functions.entries[i];
 			other_state = &other_func->state;
 			if (!other_state->initialized)
 				continue;
@@ -1398,8 +1441,47 @@ static struct elf_function *btf_encoder__find_function(const struct btf_encoder 
 						       const char *name, size_t prefixlen)
 {
 	struct elf_function key = { .name = name, .prefixlen = prefixlen };
+	struct elf_function *head = bsearch(&key,
+					    encoder->functions.entries,
+					    encoder->functions.cnt,
+					    sizeof(key),
+					    functions_cmp);
+	struct elf_function *func = NULL;
+	bool success = false;
 
-	return bsearch(&key, encoder->functions.entries, encoder->functions.cnt, sizeof(key), functions_cmp);
+	if (!head)
+		return NULL;
+
+	// If head->owner is NULL, then calling btf_encoder is the
+	// first one to encounter this function name.  In this case
+	// try to claim the head.
+	if (head->owner == NULL) {
+		bool success = __sync_bool_compare_and_swap(&head->owner, NULL, encoder);
+
+		if (success)
+			return head;
+	}
+
+	// Otherwise (or if claim failed), search through the list,
+	// and add new elf_function for this encoder if not found.
+	func = find_elf_function_in_list(head, encoder);
+	if (!func) {
+		func = zalloc(sizeof(*func));
+		func->name = head->name;
+		func->prefixlen = head->prefixlen;
+		// Whenever btf_encoder allocates a new elf_function, it sets
+		// itself as owner. So if the first search through the list
+		// didn't find an elf_function, we can be sure no other
+		// encoder would add it.  Therefore we only have to ensure
+		// that the head->next is updated atomically.
+		func->owner = encoder;
+		do {
+			func->next = head->next;
+			success = __sync_bool_compare_and_swap(&head->next, func->next, func);
+		} while (!success);
+	}
+
+	return func;
 }
 
 static bool btf_name_char_ok(char c, bool first)
@@ -2498,18 +2580,9 @@ out_delete:
 	return NULL;
 }
 
-void btf_encoder__delete_func(struct elf_function *func)
-{
-	free(func->alias);
-	zfree(&func->state.annots);
-	zfree(&func->state.parms);
-}
-
 void btf_encoder__delete(struct btf_encoder *encoder)
 {
-	int i;
 	size_t shndx;
-
 	if (encoder == NULL)
 		return;
 
@@ -2520,13 +2593,9 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	zfree(&encoder->source_filename);
 	btf__free(encoder->btf);
 	encoder->btf = NULL;
-	elf_symtab__delete(encoder->symtab);
 
-	for (i = 0; i < encoder->functions.cnt; i++)
-		btf_encoder__delete_func(&encoder->functions.entries[i]);
-	encoder->functions.cnt = 0;
-	free(encoder->functions.entries);
-	encoder->functions.entries = NULL;
+	__elf_functions__delete(&encoder->functions);
+
 
 	free(encoder);
 }
