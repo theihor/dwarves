@@ -32,7 +32,8 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 
 struct btf *btf_encoder__btf(struct btf_encoder *encoder);
 
-int btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other);
+int btf_encoder__add_saved_funcs(struct btf_encoder *encoder);
+int btf_encoder__merge_encoders(struct btf_encoder *base_encoder, struct btf_encoder **encoders, int nr_encoders);
 
 int btf_encoder__pre_cus__load_module(struct process_dwflmod_parms *parms, Dwfl_Module *mod, Dwarf *dw, Elf *elf);
 
