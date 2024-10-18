@@ -3741,8 +3741,12 @@ int main(int argc, char *argv[])
 		conf_load.threads_collect = pahole_threads_collect;
 	}
 
-	if (btf_encode)
+	if (btf_encode) {
 		conf_load.pre_load_module = btf_encoder__pre_load_module;
+		err = btf_encoding_context__init();
+		if (err < 0)
+			goto out;
+	}
 
 	// Make 'pahole --header type < file' a shorter form of 'pahole -C type --count 1 < file'
 	if (conf.header_type && !class_name && prettify_input) {
@@ -3858,7 +3862,11 @@ try_sole_arg_as_class_names:
 			goto out_cus_delete;
 		}
 	}
+
 out_ok:
+	if (btf_encode)
+		btf_encoding_context__exit();
+
 	if (stats_formatter != NULL)
 		print_stats();
 

@@ -151,19 +151,73 @@ struct btf_kfunc_set_range {
 	uint64_t end;
 };
 
+static struct {
+	bool initialized;
 
-/* In principle, multiple ELFs can be processed in one pahole run,
- * so we have to store elf_functions table per ELF.
- * An element is added to the list on btf_encoder__pre_load_module,
- * and removed after btf_encoder__encode is done.
- */
-static LIST_HEAD(elf_functions_list);
+	/* In principle, multiple ELFs can be processed in one pahole
+	 * run, so we have to store elf_functions table per ELF.
+	 * An elf_functions struct is added to the list in
+	 * btf_encoder__pre_load_module().
+	 * The list is cleared at the end of btf_encoder__add_saved_funcs().
+	 */
+	struct list_head elf_functions_list;
+
+	/* The mutex only needed for add/delete, as this can happen in
+	 * multiple encoding threads.  A btf_encoder is added to this
+	 * list in btf_encoder__new(), and removed in btf_encoder__delete().
+	 * All encoders except the main one (`btf_encoder` in pahole.c)
+	 * are deleted in pahole_threads_collect().
+	 */
+	pthread_mutex_t btf_encoder_list_lock;
+	struct list_head btf_encoder_list;
+
+} btf_encoding_context;
+
+int btf_encoding_context__init(void)
+{
+	int err = 0;
+
+	if (btf_encoding_context.initialized) {
+		fprintf(stderr, "%s was called while context is already initialized\n", __func__);
+		err = -1;
+		goto out;
+	}
+
+	INIT_LIST_HEAD(&btf_encoding_context.elf_functions_list);
+	INIT_LIST_HEAD(&btf_encoding_context.btf_encoder_list);
+	pthread_mutex_init(&btf_encoding_context.btf_encoder_list_lock, NULL);
+	btf_encoding_context.initialized = true;
+
+out:
+	return err;
+}
+
+static inline void btf_encoder__delete_all(void);
+static inline void elf_functions__delete_all(void);
+
+void btf_encoding_context__exit(void)
+{
+	if (!btf_encoding_context.initialized) {
+		fprintf(stderr, "%s was called while context is not initialized\n", __func__);
+		return;
+	}
+
+	if (!list_empty(&btf_encoding_context.elf_functions_list))
+		elf_functions__delete_all();
+
+	if (!list_empty(&btf_encoding_context.btf_encoder_list))
+		btf_encoder__delete_all();
+
+	pthread_mutex_destroy(&btf_encoding_context.btf_encoder_list_lock);
+	btf_encoding_context.initialized = false;
+}
+
 
 static struct elf_functions *elf_functions__get(Elf *elf)
 {
 	struct list_head *pos;
 
-	list_for_each(pos, &elf_functions_list) {
+	list_for_each(pos, &btf_encoding_context.elf_functions_list) {
 		struct elf_functions *funcs = list_entry(pos, struct elf_functions, node);
 
 		if (funcs->elf == elf)
@@ -184,9 +238,8 @@ static inline void elf_functions__delete_all(void)
 {
 	struct list_head *pos, *tmp;
 
-	list_for_each_safe(pos, tmp, &elf_functions_list) {
+	list_for_each_safe(pos, tmp, &btf_encoding_context.elf_functions_list) {
 		struct elf_functions *funcs = list_entry(pos, struct elf_functions, node);
-
 		elf_functions__delete(funcs);
 	}
 }
@@ -215,7 +268,7 @@ int btf_encoder__pre_load_module(Dwfl_Module *mod, Elf *elf)
 	if (err)
 		goto out_delete;
 
-	list_add_tail(&funcs->node, &elf_functions_list);
+	list_add_tail(&funcs->node, &btf_encoding_context.elf_functions_list);
 
 	return 0;
 
@@ -224,29 +277,21 @@ out_delete:
 	return err;
 }
 
-
-static LIST_HEAD(encoders);
-static pthread_mutex_t encoders__lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* mutex only needed for add/delete, as this can happen in multiple encoding
- * threads.  Traversal of the list is currently confined to thread collection.
- */
-
 #define btf_encoders__for_each_encoder(encoder)		\
-	list_for_each_entry(encoder, &encoders, node)
+	list_for_each_entry(encoder, &btf_encoding_context.btf_encoder_list, node)
 
 static void btf_encoders__add(struct btf_encoder *encoder)
 {
-	pthread_mutex_lock(&encoders__lock);
-	list_add_tail(&encoder->node, &encoders);
-	pthread_mutex_unlock(&encoders__lock);
+	pthread_mutex_lock(&btf_encoding_context.btf_encoder_list_lock);
+	list_add_tail(&encoder->node, &btf_encoding_context.btf_encoder_list);
+	pthread_mutex_unlock(&btf_encoding_context.btf_encoder_list_lock);
 }
 
 static void btf_encoders__delete(struct btf_encoder *encoder)
 {
 	struct btf_encoder *existing = NULL;
 
-	pthread_mutex_lock(&encoders__lock);
+	pthread_mutex_lock(&btf_encoding_context.btf_encoder_list_lock);
 	/* encoder may not have been added to list yet; check. */
 	btf_encoders__for_each_encoder(existing) {
 		if (encoder == existing)
@@ -254,7 +299,7 @@ static void btf_encoders__delete(struct btf_encoder *encoder)
 	}
 	if (encoder == existing)
 		list_del(&encoder->node);
-	pthread_mutex_unlock(&encoders__lock);
+	pthread_mutex_unlock(&btf_encoding_context.btf_encoder_list_lock);
 }
 
 #define PERCPU_SECTION ".data..percpu"
@@ -1355,19 +1400,15 @@ int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 		list_for_each_entry(s, &e->func_states, node)
 			nr_saved_fns++;
 	}
-	/* Another thread already did this work */
-	if (nr_saved_fns == 0) {
-		printf("nothing to do for encoder...\n");
-		return 0;
-	}
 
-	printf("got %d saved functions...\n", nr_saved_fns);
+	if (nr_saved_fns == 0)
+		return 0;
+
 	saved_fns = calloc(nr_saved_fns, sizeof(*saved_fns));
 	btf_encoders__for_each_encoder(e) {
 		list_for_each_entry(s, &e->func_states, node)
 			saved_fns[i++] = s;
 	}
-	printf("added %d saved fns\n", i);
 	qsort(saved_fns, nr_saved_fns, sizeof(*saved_fns), saved_functions_cmp);
 
 	for (i = 0; i < nr_saved_fns; i = j) {
@@ -1399,6 +1440,9 @@ int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 	free(saved_fns);
 	btf_encoders__for_each_encoder(e)
 		btf_encoder__delete_saved_funcs(e);
+
+	elf_functions__delete_all();
+
 	return 0;
 }
 
@@ -2177,7 +2221,6 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 		err = btf_encoder__write_elf(encoder, encoder->btf, BTF_ELF_SEC);
 	}
 
-	elf_functions__delete_all();
 	return err;
 }
 
@@ -2563,6 +2606,18 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 
 	free(encoder);
 }
+
+static inline void btf_encoder__delete_all(void)
+{
+	struct btf_encoder *encoder;
+	struct list_head *pos, *tmp;
+
+	list_for_each_safe(pos, tmp, &btf_encoding_context.btf_encoder_list) {
+		encoder = list_entry(pos, struct btf_encoder, node);
+		btf_encoder__delete(encoder);
+	}
+}
+
 
 int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct conf_load *conf_load)
 {
