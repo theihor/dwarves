@@ -106,6 +106,7 @@ struct conf_load {
 	bool			btf_encode_force;
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
+	bool			btf_encode_verbose;
 	bool			btf_gen_distilled_base;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;
@@ -297,6 +298,7 @@ struct cu {
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
 	struct rb_root	 functions;
+	uint32_t	 id;
 	const char	 *name;
 	char		 *filename;
 	void 		 *priv;

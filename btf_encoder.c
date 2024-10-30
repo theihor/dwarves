@@ -118,6 +118,7 @@ struct btf_encoder {
 	struct list_head  node;
 	struct btf        *btf;
 	struct cu         *cu;
+	uint32_t	  	  cu_id;
 	const char	  *source_filename;
 	const char	  *filename;
 	struct elf_symtab *symtab;
@@ -129,7 +130,6 @@ struct btf_encoder {
 			  force,
 			  gen_floats,
 			  skip_encoding_decl_tag,
-			  skip_encoding_inconsistent_proto,
 			  tag_kfuncs,
 			  gen_distilled_base;
 	uint32_t	  array_index_id;
@@ -170,6 +170,7 @@ static struct {
 	 */
 	pthread_mutex_t btf_encoder_list_lock;
 	struct list_head btf_encoder_list;
+	uint32_t btf_encoder_cnt;
 
 } btf_encoding_context;
 
@@ -186,8 +187,8 @@ int btf_encoding_context__init()
 	INIT_LIST_HEAD(&btf_encoding_context.elf_functions_list);
 	INIT_LIST_HEAD(&btf_encoding_context.btf_encoder_list);
 	pthread_mutex_init(&btf_encoding_context.btf_encoder_list_lock, NULL);
+	btf_encoding_context.btf_encoder_cnt = 0;
 	btf_encoding_context.initialized = true;
-
 out:
 	return err;
 }
@@ -280,25 +281,31 @@ out_delete:
 #define btf_encoders__for_each_encoder(encoder)		\
 	list_for_each_entry(encoder, &btf_encoding_context.btf_encoder_list, node)
 
+#define btf_encoders__for_each_encoder_safe(encoder, tmp)		\
+	list_for_each_entry_safe(encoder, tmp, &btf_encoding_context.btf_encoder_list, node)
+
 static void btf_encoders__add(struct btf_encoder *encoder)
 {
 	pthread_mutex_lock(&btf_encoding_context.btf_encoder_list_lock);
 	list_add_tail(&encoder->node, &btf_encoding_context.btf_encoder_list);
+	btf_encoding_context.btf_encoder_cnt++;
 	pthread_mutex_unlock(&btf_encoding_context.btf_encoder_list_lock);
 }
 
 static void btf_encoders__delete(struct btf_encoder *encoder)
 {
-	struct btf_encoder *existing = NULL;
+	struct btf_encoder *existing, *tmp;
 
 	pthread_mutex_lock(&btf_encoding_context.btf_encoder_list_lock);
 	/* encoder may not have been added to list yet; check. */
-	btf_encoders__for_each_encoder(existing) {
+	btf_encoders__for_each_encoder_safe(existing, tmp) {
 		if (encoder == existing)
 			break;
 	}
-	if (encoder == existing)
+	if (encoder == existing) {
 		list_del(&encoder->node);
+		btf_encoding_context.btf_encoder_cnt--;
+	}
 	pthread_mutex_unlock(&btf_encoding_context.btf_encoder_list_lock);
 }
 
@@ -949,7 +956,11 @@ int32_t btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder
 		}
 	}
 
-	return btf__add_btf(encoder->btf, other->btf);
+	int err = btf__add_btf(encoder->btf, other->btf);
+	if (err < 0)
+		return err;
+
+	return 0;
 }
 
 static int32_t btf_encoder__add_datasec(struct btf_encoder *encoder, size_t shndx)
@@ -1387,7 +1398,7 @@ static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
 	}
 }
 
-int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
+int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
 {
 	struct btf_encoder_func_state **saved_fns, *s;
 	struct btf_encoder *e = NULL;
@@ -1432,7 +1443,7 @@ int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 		 * just do not _use_ them.  Only exclude functions with
 		 * unexpected register use or multiple inconsistent prototypes.
 		 */
-		if (!encoder->skip_encoding_inconsistent_proto ||
+		if (!skip_encoding_inconsistent_proto ||
 		    (!state->unexpected_reg && !state->inconsistent_proto)) {
 			if (btf_encoder__add_func(state->encoder, state)) {
 				free(saved_fns);
@@ -2483,11 +2494,13 @@ out:
 	return err;
 }
 
-struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool verbose, struct conf_load *conf_load)
+struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, struct conf_load *conf_load)
 {
 	struct btf_encoder *encoder = zalloc(sizeof(*encoder));
 
 	if (encoder) {
+		encoder->cu = cu;
+		encoder->cu_id = cu->id;
 		encoder->raw_output = detached_filename != NULL;
 		encoder->source_filename = strdup(cu->filename);
 		encoder->filename = strdup(encoder->raw_output ? detached_filename : cu->filename);
@@ -2501,10 +2514,9 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		encoder->force		 = conf_load->btf_encode_force;
 		encoder->gen_floats	 = conf_load->btf_gen_floats;
 		encoder->skip_encoding_decl_tag	 = conf_load->skip_encoding_btf_decl_tag;
-		encoder->skip_encoding_inconsistent_proto = conf_load->skip_encoding_btf_inconsistent_proto;
 		encoder->tag_kfuncs	 = conf_load->btf_decl_tag_kfuncs;
 		encoder->gen_distilled_base = conf_load->btf_gen_distilled_base;
-		encoder->verbose	 = verbose;
+		encoder->verbose	 = conf_load->btf_encode_verbose;
 		encoder->has_index_type  = false;
 		encoder->need_index_type = false;
 		encoder->array_index_id  = 0;
@@ -2619,6 +2631,8 @@ static inline void btf_encoder__delete_all(void)
 		struct btf_encoder *encoder = list_entry(pos, struct btf_encoder, node);
 		btf_encoder__delete(encoder);
 	}
+
+	btf_encoding_context.btf_encoder_cnt = 0;
 }
 
 
@@ -2631,7 +2645,6 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	struct tag *pos;
 	int err = 0;
 
-	encoder->cu = cu;
 	encoder->type_id_off = btf__type_cnt(encoder->btf) - 1;
 
 	if (!encoder->has_index_type) {
@@ -2774,4 +2787,52 @@ out:
 struct btf *btf_encoder__btf(struct btf_encoder *encoder)
 {
 	return encoder->btf;
+}
+
+int btf_encoder__merge_encoders(struct btf_encoder *main_encoder, struct conf_load *conf_load)
+{
+	uint32_t nr_encoders = btf_encoding_context.btf_encoder_cnt;
+	struct btf_encoder *all_encoders[nr_encoders];
+	struct btf_encoder *encoder;
+	uint32_t i = 0;
+	int err = 0;
+
+	err = btf_encoder__add_saved_funcs(conf_load->skip_encoding_btf_inconsistent_proto);
+	if (err < 0)
+		goto out;
+
+	// We rely on 0 <= cu_id < btf_encoding_context.btf_encoder_cnt here 
+	// to ensure all_encoders is sorted by cu_id.
+	// We can do that because we know that cu_id = dcu->nextcu_counter
+	// and that each btf_encoder is associated with a single CU.
+	btf_encoders__for_each_encoder(encoder) {
+		if (encoder->cu_id < 0 || encoder->cu_id >= nr_encoders) {
+			fprintf(stderr, "cu_id is out of expected range: %d\n", encoder->cu_id);
+			err = -1;
+			goto out;
+		}
+		all_encoders[encoder->cu_id] = encoder;
+	}
+
+	if (all_encoders[0] != main_encoder) {
+		fprintf(stderr, "main_encoder is not associated with the first DWARF CU, cannot guarantee reproducible_build\n");
+	}
+
+	for (i = 1; i < nr_encoders; i++) {
+		encoder = all_encoders[i];
+		
+		if (!encoder || !encoder->btf || encoder == main_encoder)
+			continue;
+
+		err = btf_encoder__add_encoder(main_encoder, encoder);
+		if (err < 0)
+			goto out;
+
+		btf_encoder__delete(encoder);
+	}
+
+	err = 0;
+
+out:
+	return err;
 }
