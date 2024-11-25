@@ -136,6 +136,7 @@ struct btf_encoder {
 	struct elf_secinfo *secinfo;
 	size_t             seccnt;
 	int                encode_vars;
+	uint32_t           nr_func_states;
 	struct list_head   func_states;
 	struct elf_functions *functions;
 };
@@ -1270,6 +1271,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 			idx++;
 		}
 	}
+	encoder->nr_func_states++;
 	list_add_tail(&state->node, &encoder->func_states);
 	return 0;
 out:
@@ -1398,32 +1400,33 @@ static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
 	}
 }
 
-int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
+/*
+ * A sorted array of encoders is expected here to ensure reproducibility for BTF output.
+ * If we didn't care about the order, btf_encoders__for_each_encoder() would be used to iterate over encoders.
+ */
+int btf_encoder__add_saved_funcs(struct btf_encoder **encoders, int32_t nr_encoders, bool skip_encoding_inconsistent_proto)
 {
 	struct btf_encoder_func_state **saved_fns, *s;
-	struct btf_encoder *e = NULL;
 	int i = 0, j, nr_saved_fns = 0;
 
+	for (i = 0; i < nr_encoders; i++) {
+		nr_saved_fns += encoders[i]->nr_func_states;
+	}
+
+	if (nr_saved_fns == 0) {
+		return 0;
+	}
+	
 	/* Retrieve function states from each encoder, combine them
 	 * and sort by name, addr.
 	 */
-	btf_encoders__for_each_encoder(e) {
-		list_for_each_entry(s, &e->func_states, node)
-			nr_saved_fns++;
-	}
-	/* Another thread already did this work */
-	if (nr_saved_fns == 0) {
-		printf("nothing to do for encoder...\n");
-		return 0;
-	}
-
-	printf("got %d saved functions...\n", nr_saved_fns);
 	saved_fns = calloc(nr_saved_fns, sizeof(*saved_fns));
-	btf_encoders__for_each_encoder(e) {
-		list_for_each_entry(s, &e->func_states, node)
-			saved_fns[i++] = s;
+	j = 0;
+	for (i = 0; i < nr_encoders; i++) {
+		struct btf_encoder *encoder = encoders[i];
+		list_for_each_entry(s, &encoder->func_states, node)
+			saved_fns[j++] = s;
 	}
-	printf("added %d saved fns\n", i);
 	qsort(saved_fns, nr_saved_fns, sizeof(*saved_fns), saved_functions_cmp);
 
 	for (i = 0; i < nr_saved_fns; i = j) {
@@ -1453,8 +1456,8 @@ int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
 	}
 	/* Now that we are done with function states, free them. */
 	free(saved_fns);
-	btf_encoders__for_each_encoder(e)
-		btf_encoder__delete_saved_funcs(e);
+	for (i = 0; i < nr_encoders; i++)
+		btf_encoder__delete_saved_funcs(encoders[i]);
 
 	elf_functions__delete_all();
 
@@ -2207,6 +2210,7 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 		fprintf(stderr, "%s: btf__dedup failed!\n", __func__);
 		return -1;
 	}
+
 	if (encoder->raw_output) {
 		err = btf_encoder__write_raw_file(encoder);
 	} else {
@@ -2797,10 +2801,6 @@ int btf_encoder__merge_encoders(struct btf_encoder *main_encoder, struct conf_lo
 	uint32_t i = 0;
 	int err = 0;
 
-	err = btf_encoder__add_saved_funcs(conf_load->skip_encoding_btf_inconsistent_proto);
-	if (err < 0)
-		goto out;
-
 	// We rely on 0 <= cu_id < btf_encoding_context.btf_encoder_cnt here 
 	// to ensure all_encoders is sorted by cu_id.
 	// We can do that because we know that cu_id = dcu->nextcu_counter
@@ -2813,6 +2813,10 @@ int btf_encoder__merge_encoders(struct btf_encoder *main_encoder, struct conf_lo
 		}
 		all_encoders[encoder->cu_id] = encoder;
 	}
+
+	err = btf_encoder__add_saved_funcs(all_encoders, nr_encoders, conf_load->skip_encoding_btf_inconsistent_proto);
+	if (err < 0)
+		goto out;
 
 	if (all_encoders[0] != main_encoder) {
 		fprintf(stderr, "main_encoder is not associated with the first DWARF CU, cannot guarantee reproducible_build\n");
