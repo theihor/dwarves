@@ -49,6 +49,7 @@ enum cu_state {
 	CU__UNPROCESSED,
 	CU__LOADED,
 	CU__PROCESSING,
+	CU__PROCESSED,
 };
 
 /*
@@ -194,8 +195,9 @@ void cus__add(struct cus *cus, struct cu *cu);
 
 void __cus__remove(struct cus *cus, struct cu *cu);
 void cus__remove(struct cus *cus, struct cu *cu);
+void cus__remove_processed_cus(struct cus *cus);
 
-struct cu *cus__get_next_processable_cu(struct cus *cus);
+struct cu *cus__get_cu_by_id(struct cus *cus, uint32_t id);
 
 void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
 
@@ -297,6 +299,7 @@ struct cu {
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
 	struct rb_root	 functions;
+	uint32_t	 id;
 	const char	 *name;
 	char		 *filename;
 	void 		 *priv;

@@ -537,39 +537,18 @@ void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state)
 	cus__unlock(cus);
 }
 
-// Used only when reproducible builds are desired
-struct cu *cus__get_next_processable_cu(struct cus *cus)
+struct cu *cus__get_cu_by_id(struct cus *cus, uint32_t id)
 {
-	struct cu *cu;
-
+	struct cu *cu, *result = NULL;
 	cus__lock(cus);
-
 	list_for_each_entry(cu, &cus->cus, node) {
-		switch (cu->state) {
-		case CU__LOADED:
-			cu->state = CU__PROCESSING;
-			goto found;
-		case CU__PROCESSING:
-			// This will happen when we get to parallel
-			// reproducible BTF encoding, libbpf dedup work needed
-			// here. The other possibility is when we're flushing
-			// the DWARF processed CUs when the parallel DWARF
-			// loading stoped and we still have CUs to encode to
-			// BTF because of ordering requirements.
-			continue;
-		case CU__UNPROCESSED:
-			// The first entry isn't loaded, signal the
-			// caller to return and try another day, as we
-			// need to respect the original DWARF CU ordering.
-			goto out;
+		if (cu->id == id) {
+			result = cu;
+			break;
 		}
 	}
-out:
-	cu = NULL;
-found:
 	cus__unlock(cus);
-
-	return cu;
+	return result;
 }
 
 bool cus__empty(const struct cus *cus)
@@ -608,6 +587,20 @@ void cus__add(struct cus *cus, struct cu *cu)
 	cus__unlock(cus);
 
 	cu__find_class_holes(cu);
+}
+
+void cus__remove_processed_cus(struct cus *cus)
+{
+	struct cu *cu, *tmp;
+
+	cus__lock(cus);
+	list_for_each_entry_safe(cu, tmp, &cus->cus, node) {
+		if (cu->state == CU__PROCESSED) {
+			__cus__remove(cus, cu);
+			cu__delete(cu);
+		}
+	}
+	cus__unlock(cus);
 }
 
 static void ptr_table__init(struct ptr_table *pt)

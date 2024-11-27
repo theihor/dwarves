@@ -94,6 +94,7 @@ static struct conf_fprintf conf = {
 
 static struct conf_load conf_load = {
 	.conf_fprintf = &conf,
+	.nr_jobs = 1,
 };
 
 struct structure {
@@ -3136,26 +3137,13 @@ static bool print_enumeration_with_enumerator(struct cu *cu, const char *name)
 	return false;
 }
 
-struct thread_data {
-	struct btf *btf;
-	struct btf_encoder *encoder;
-};
-
-static int pahole_threads_prepare_reproducible_build(struct conf_load *conf, int nr_threads, void **thr_data)
-{
-	for (int i = 0; i < nr_threads; i++)
-		thr_data[i] = NULL;
-
-	return 0;
-}
+// not used yet
+struct thread_data { int dummy; };
 
 static int pahole_threads_prepare(struct conf_load *conf, int nr_threads, void **thr_data)
 {
-	int i;
-	struct thread_data *threads = calloc(sizeof(struct thread_data), nr_threads);
-
-	for (i = 0; i < nr_threads; i++)
-		thr_data[i] = threads + i;
+	for (int i = 0; i < nr_threads; i++)
+		thr_data[i] = NULL;
 
 	return 0;
 }
@@ -3179,7 +3167,6 @@ static int pahole_threads_collect(struct conf_load *conf, int nr_threads, void *
 				  int error)
 {
 	struct thread_data **threads = (struct thread_data **)thr_data;
-	int i;
 	int err = 0;
 
 	if (error)
@@ -3189,29 +3176,97 @@ static int pahole_threads_collect(struct conf_load *conf, int nr_threads, void *
 	if (err < 0)
 		goto out;
 
-	for (i = 0; i < nr_threads; i++) {
-		/*
-		 * Merge content of the btf instances of worker threads to the btf
-		 * instance of the primary btf_encoder.
-                */
-		if (!threads[i]->encoder || !threads[i]->btf)
-			continue;
-		err = btf_encoder__add_encoder(btf_encoder, threads[i]->encoder);
-		if (err < 0)
-			goto out;
-	}
-	err = 0;
-
 out:
-	for (i = 0; i < nr_threads; i++) {
-		if (threads[i]->encoder && threads[i]->encoder != btf_encoder) {
-			btf_encoder__delete(threads[i]->encoder);
-			threads[i]->encoder = NULL;
-		}
-	}
 	free(threads[0]);
 
 	return err;
+}
+
+static inline void btf_encoder__init(struct cu *cu, struct conf_load *conf_load)
+{
+	btf_encoder = btf_encoder__new(cu,
+				       detached_btf_filename,
+				       conf_load->base_btf,
+				       global_verbose,
+				       conf_load);
+	if (!btf_encoder) {
+		fprintf(stderr, "Error creating BTF encoder.\n");
+		exit(1);
+	}
+}
+
+static enum load_steal_kind pahole_stealer__threaded_btf_encode(struct cu *cu, struct conf_load *conf_load)
+{
+	static pthread_mutex_t btf_encode_lock = PTHREAD_MUTEX_INITIALIZER;
+	static uint32_t next_cu_id_to_encode;
+
+	struct cu *cu_to_encode = NULL;
+	int encoding_ret;
+
+	if (pthread_mutex_trylock(&btf_encode_lock) != 0) {
+		/* Another thread is busy encoding.
+		 * Check the number of CUs in queue, and if it's too high, wait.
+		 */
+		while (cus__nr_entries(cus) >= conf_load->nr_jobs - 1) {
+			usleep(1000);
+			cus__remove_processed_cus(cus);
+		}
+		goto out;
+	}
+
+	/* Got the lock: check whether btf_encoder has already been created */
+	if (!btf_encoder) {
+		if (cu->id == 0)
+			btf_encoder__init(cu, conf_load);
+		goto out_unlock;
+	}
+
+	/* Proceed to encoding in order of cu->id
+	 * cus->cus serves as a queue of loaded cu-s
+	 * Keep encoding until a cu with expected id is not yet loaded
+	 */
+	do {
+		cu_to_encode = cus__get_cu_by_id(cus, next_cu_id_to_encode);
+		if (!cu_to_encode || cu_to_encode->state != CU__LOADED)
+			break;
+
+		encoding_ret = btf_encoder__encode_cu(btf_encoder,
+						      cu_to_encode,
+						      conf_load);
+		if (encoding_ret < 0) {
+			fprintf(stderr, "Encountered error while encoding BTF.\n");
+			exit(1);
+		}
+
+		cus__set_cu_state(cus, cu_to_encode, CU__PROCESSED);
+		next_cu_id_to_encode++;
+	} while (true);
+
+out_unlock:
+	pthread_mutex_unlock(&btf_encode_lock);
+out:
+	// always keep incoming CUs
+	// they will be deleted by cus__remove_processed_cus()
+	return LSK__KEEPIT;
+}
+
+static enum load_steal_kind pahole_stealer__btf_encode(struct cu *cu, struct conf_load *conf_load)
+{
+	int ret;
+
+	if (!btf_encoder)
+		btf_encoder__init(cu, conf_load);
+
+	ret = btf_encoder__encode_cu(btf_encoder, cu, conf_load);
+	if (ret < 0) {
+		fprintf(stderr, "Encountered error while encoding BTF.\n");
+		exit(1);
+	}
+
+	// This has no meaning for a single thread, but let's be consistent
+	cus__set_cu_state(cus, cu, CU__PROCESSED);
+
+	return ret;
 }
 
 static enum load_steal_kind pahole_stealer(struct cu *cu,
@@ -3238,94 +3293,10 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		return LSK__DELETE; // Maybe we can find this in several CUs, so don't stop it
 
 	if (btf_encode) {
-		static pthread_mutex_t btf_lock = PTHREAD_MUTEX_INITIALIZER;
-		struct btf_encoder *encoder;
-
-		pthread_mutex_lock(&btf_lock);
-		/*
-		 * FIXME:
-		 *
-		 * This should be really done at main(), but since in the current codebase only at this
-		 * point we'll have cu->elf setup...
-		 */
-		if (!btf_encoder) {
-			/*
-			 * btf_encoder is the primary encoder.
-			 * And, it is used by the thread
-			 * create it.
-			 */
-			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf,
-						       global_verbose, conf_load);
-			if (btf_encoder && thr_data) {
-				struct thread_data *thread = thr_data;
-
-				thread->encoder = btf_encoder;
-				thread->btf = btf_encoder__btf(btf_encoder);
-			}
-		}
-
-		// Reproducible builds don't have multiple btf_encoders, so we need to keep the lock until we encode BTF for this CU.
-		if (thr_data)
-			pthread_mutex_unlock(&btf_lock);
-
-		if (!btf_encoder) {
-			ret = LSK__STOP_LOADING;
-			goto out_btf;
-		}
-
-		/*
-		 * thr_data keeps per-thread data for worker threads.  Each worker thread
-		 * has an encoder.  The main thread will merge the data collected by all
-		 * these encoders to btf_encoder.  However, the first thread reaching this
-		 * function creates btf_encoder and reuses it as its local encoder.  It
-		 * avoids copying the data collected by the first thread.
-		 */
-		if (thr_data) {
-			struct thread_data *thread = thr_data;
-
-			if (thread->encoder == NULL) {
-				thread->encoder =
-					btf_encoder__new(cu, detached_btf_filename,
-							 NULL,
-							 global_verbose,
-							 conf_load);
-				thread->btf = btf_encoder__btf(thread->encoder);
-			}
-			encoder = thread->encoder;
-		} else {
-			encoder = btf_encoder;
-		}
-
-		// Since we don't have yet a way to parallelize the BTF encoding, we
-		// need to ask the loader for the next CU that we can process, one
-		// that is loaded and is in order, if the next one isn't yet loaded,
-		// then return to let the DWARF loader thread to load the next one,
-		// eventually all will get processed, even if when all DWARF loading
-		// threads finish.
-		if (conf_load->reproducible_build) {
-			ret = LSK__KEEPIT; // we're not processing the cu passed to this
-					  // function, so keep it.
-			cu = cus__get_next_processable_cu(cus);
-			if (cu == NULL)
-				goto out_btf;
-		}
-
-		ret = btf_encoder__encode_cu(encoder, cu, conf_load);
-		if (ret < 0) {
-			fprintf(stderr, "Encountered error while encoding BTF.\n");
-			exit(1);
-		}
-
-		if (conf_load->reproducible_build) {
-			ret = LSK__KEEPIT; // we're not processing the cu passed to this function, so keep it.
-			// Kinda equivalent to LSK__DELETE since we processed this, but we can't delete it
-			// as we stash references to entries in CUs for 'struct function' in btf_encoder__add_saved_funcs()
-			// and btf_encoder__save_func(), so we can't delete them here. - Alan Maguire
-		}
-out_btf:
-		if (!thr_data) // See comment about reproducibe_build above
-			pthread_mutex_unlock(&btf_lock);
-		return ret;
+		if (conf_load->nr_jobs > 1)
+			return pahole_stealer__threaded_btf_encode(cu, conf_load);
+		else
+			return pahole_stealer__btf_encode(cu, conf_load);
 	}
 #if 0
 	if (ctf_encode) {
@@ -3625,24 +3596,6 @@ out_free:
 	return ret;
 }
 
-static int cus__flush_reproducible_build(struct cus *cus, struct btf_encoder *encoder, struct conf_load *conf_load)
-{
-	int err = 0;
-
-	while (true) {
-		struct cu *cu = cus__get_next_processable_cu(cus);
-
-		if (cu == NULL)
-			break;
-
-		err = btf_encoder__encode_cu(encoder, cu, conf_load);
-		if (err < 0)
-			break;
-	}
-
-	return err;
-}
-
 int main(int argc, char *argv[])
 {
 	int err, remaining, rc = EXIT_FAILURE;
@@ -3731,18 +3684,12 @@ int main(int argc, char *argv[])
 	if (languages.exclude)
 		conf_load.early_cu_filter = cu__filter;
 
-	conf_load.thread_exit = pahole_thread_exit;
-
-	if (conf_load.reproducible_build) {
-		conf_load.threads_prepare = pahole_threads_prepare_reproducible_build;
-		conf_load.threads_collect = NULL;
-	} else {
-		conf_load.threads_prepare = pahole_threads_prepare;
-		conf_load.threads_collect = pahole_threads_collect;
-	}
-
 	if (btf_encode) {
 		conf_load.pre_load_module = btf_encoder__pre_load_module;
+		conf_load.threads_prepare = pahole_threads_prepare;
+		conf_load.threads_collect = pahole_threads_collect;
+		conf_load.thread_exit = pahole_thread_exit;
+
 		err = btf_encoding_context__init();
 		if (err < 0)
 			goto out;
@@ -3847,13 +3794,9 @@ try_sole_arg_as_class_names:
 	header = NULL;
 
 	if (btf_encode && btf_encoder) { // maybe all CUs were filtered out and thus we don't have an encoder?
-		if (conf_load.reproducible_build &&
-		    cus__flush_reproducible_build(cus, btf_encoder, &conf_load) < 0) {
-			fprintf(stderr, "Encountered error while encoding BTF.\n");
-			exit(1);
-		}
 
-		if (conf_load.nr_jobs <= 1 || conf_load.reproducible_build)
+		// pahole_threads_collect() is not called in single-threaded runs
+		if (conf_load.nr_jobs <= 1)
 			btf_encoder__add_saved_funcs(btf_encoder);
 
 		err = btf_encoder__encode(btf_encoder);
