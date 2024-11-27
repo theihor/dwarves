@@ -3440,6 +3440,7 @@ struct dwarf_cus {
 	int		    build_id_len;
 	int		    error;
 	struct dwarf_cu	    *type_dcu;
+	uint32_t	nr_cus_created;
 };
 
 struct dwarf_thread {
@@ -3471,6 +3472,9 @@ static struct dwarf_cu *dwarf_cus__create_cu(struct dwarf_cus *dcus, Dwarf_Die *
 	dcu->type_unit = dcus->type_dcu;
 	cu->priv = dcu;
 	cu->dfops = &dwarf__ops;
+
+	cu->id = dcus->nr_cus_created;
+	dcus->nr_cus_created++;
 
 	return dcu;
 }
@@ -3796,13 +3800,6 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	return DWARF_CB_OK;
 }
 
-struct process_dwflmod_parms {
-	struct cus	 *cus;
-	struct conf_load *conf;
-	const char	 *filename;
-	uint32_t	 nr_dwarf_sections_found;
-};
-
 static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 				void **userdata __maybe_unused,
 				const char *name __maybe_unused,
@@ -3826,11 +3823,18 @@ static int cus__process_dwflmod(Dwfl_Module *dwflmod,
 	Dwarf *dw = dwfl_module_getdwarf(dwflmod, &dwbias);
 
 	int err = DWARF_CB_OK;
+	if (parms->conf->pre_load_module) {
+		err = parms->conf->pre_load_module(dwflmod, elf);
+		if (err)
+			return DWARF_CB_ABORT;
+	}
+
 	if (dw != NULL) {
 		++parms->nr_dwarf_sections_found;
 		err = cus__load_module(cus, parms->conf, dwflmod, dw, elf,
 				       parms->filename);
 	}
+
 	/*
 	 * XXX We will fall back to try finding other debugging
 	 * formats (CTF), so no point in telling this to the user

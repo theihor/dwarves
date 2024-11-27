@@ -37,6 +37,7 @@
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
 
 struct cu;
+struct cus;
 
 enum load_steal_kind {
 	LSK__KEEPIT,
@@ -48,6 +49,7 @@ enum cu_state {
 	CU__UNPROCESSED,
 	CU__LOADED,
 	CU__PROCESSING,
+	CU__PROCESSED,
 };
 
 /*
@@ -58,6 +60,13 @@ typedef uint32_t type_id_t;
 
 struct btf;
 struct conf_fprintf;
+
+struct process_dwflmod_parms {
+	struct cus	 *cus;
+	struct conf_load *conf;
+	const char	 *filename;
+	uint32_t	 nr_dwarf_sections_found;
+};
 
 /** struct conf_load - load configuration
  * @thread_exit - called at the end of a thread, 1st user: BTF encoder dedup
@@ -107,6 +116,7 @@ struct conf_load {
 	struct conf_fprintf	*conf_fprintf;
 	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
 	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
+	int			(*pre_load_module)(Dwfl_Module *mod, Elf *elf);
 };
 
 /** struct conf_fprintf - hints to the __fprintf routines
@@ -168,8 +178,6 @@ struct conf_fprintf {
 	uint8_t    skip_emitting_modifier:1;
 };
 
-struct cus;
-
 struct cus *cus__new(void);
 void cus__delete(struct cus *cus);
 
@@ -187,8 +195,9 @@ void cus__add(struct cus *cus, struct cu *cu);
 
 void __cus__remove(struct cus *cus, struct cu *cu);
 void cus__remove(struct cus *cus, struct cu *cu);
+void cus__remove_processed_cus(struct cus *cus);
 
-struct cu *cus__get_next_processable_cu(struct cus *cus);
+struct cu *cus__get_cu_by_id(struct cus *cus, uint32_t id);
 
 void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
 
@@ -290,6 +299,7 @@ struct cu {
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
 	struct rb_root	 functions;
+	uint32_t	 id;
 	const char	 *name;
 	char		 *filename;
 	void 		 *priv;
