@@ -3185,7 +3185,7 @@ static int pahole_threads_collect(struct conf_load *conf, int nr_threads, void *
 	if (error)
 		goto out;
 
-	err = btf_encoder__add_saved_funcs(btf_encoder);
+	err = btf_encoder__add_saved_funcs(conf_load.skip_encoding_btf_inconsistent_proto);
 	if (err < 0)
 		goto out;
 
@@ -3854,7 +3854,7 @@ try_sole_arg_as_class_names:
 		}
 
 		if (conf_load.nr_jobs <= 1 || conf_load.reproducible_build)
-			btf_encoder__add_saved_funcs(btf_encoder);
+			btf_encoder__add_saved_funcs(conf_load.skip_encoding_btf_inconsistent_proto);
 
 		err = btf_encoder__encode(btf_encoder);
 		btf_encoder__delete(btf_encoder);
