@@ -107,6 +107,7 @@ struct conf_load {
 	struct conf_fprintf	*conf_fprintf;
 	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
 	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
+	int			(*pre_load_module)(Dwfl_Module *mod, Elf *elf);
 };
 
 /** struct conf_fprintf - hints to the __fprintf routines
