@@ -1903,6 +1903,9 @@ static int btf_encoder__collect_btf_funcs(struct btf_encoder *encoder, struct go
 			goto out;
 	}
 
+	if (gobuffer__nr_entries(funcs) <= 0)
+		return 0;
+
 	/* Now that we've collected funcs, sort them by name */
 	gobuffer__sort(funcs, sizeof(struct btf_func), btf_func_cmp);
 
@@ -2061,6 +2064,11 @@ static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
 	err = btf_encoder__collect_btf_funcs(encoder, &btf_funcs);
 	if (err) {
 		fprintf(stderr, "%s: failed to collect BTF funcs\n", __func__);
+		goto out;
+	}
+
+	if (gobuffer__nr_entries(&btf_funcs) <= 0) {
+		err = 0;
 		goto out;
 	}
 

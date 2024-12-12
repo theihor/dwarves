@@ -523,53 +523,13 @@ struct cus {
 void cus__lock(struct cus *cus)
 {
 	pthread_mutex_lock(&cus->mutex);
+	// printf("thread %lu (pid %d) took a lock\n", (unsigned long)pthread_self(), getpid());
 }
 
 void cus__unlock(struct cus *cus)
 {
 	pthread_mutex_unlock(&cus->mutex);
-}
-
-void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state)
-{
-	cus__lock(cus);
-	cu->state = state;
-	cus__unlock(cus);
-}
-
-// Used only when reproducible builds are desired
-struct cu *cus__get_next_processable_cu(struct cus *cus)
-{
-	struct cu *cu;
-
-	cus__lock(cus);
-
-	list_for_each_entry(cu, &cus->cus, node) {
-		switch (cu->state) {
-		case CU__LOADED:
-			cu->state = CU__PROCESSING;
-			goto found;
-		case CU__PROCESSING:
-			// This will happen when we get to parallel
-			// reproducible BTF encoding, libbpf dedup work needed
-			// here. The other possibility is when we're flushing
-			// the DWARF processed CUs when the parallel DWARF
-			// loading stoped and we still have CUs to encode to
-			// BTF because of ordering requirements.
-			continue;
-		case CU__UNPROCESSED:
-			// The first entry isn't loaded, signal the
-			// caller to return and try another day, as we
-			// need to respect the original DWARF CU ordering.
-			goto out;
-		}
-	}
-out:
-	cu = NULL;
-found:
-	cus__unlock(cus);
-
-	return cu;
+	// printf("thread %lu (pid %d) released a lock\n", (unsigned long)pthread_self(), getpid());
 }
 
 bool cus__empty(const struct cus *cus)
@@ -807,8 +767,6 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 
 		cu->addr_size = addr_size;
 		cu->extra_dbg_info = 0;
-
-		cu->state = CU__UNPROCESSED;
 
 		cu->nr_inline_expansions   = 0;
 		cu->size_inline_expansions = 0;

@@ -44,12 +44,6 @@ enum load_steal_kind {
 	LSK__STOP_LOADING,
 };
 
-enum cu_state {
-	CU__UNPROCESSED,
-	CU__LOADED,
-	CU__PROCESSING,
-};
-
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
  * like a allyesconfig vmlinux kernel we can get over 65535 types.
@@ -70,14 +64,14 @@ struct conf_fprintf;
  * @skip_missing - skip missing types rather than bailing out.
  */
 struct conf_load {
-	enum load_steal_kind	(*steal)(struct cu *cu,
-					 struct conf_load *conf,
-					 void *thr_data);
+	enum load_steal_kind	(*steal)(struct cu *cu, struct conf_load *conf);
 	struct cu *		(*early_cu_filter)(struct cu *cu);
 	int			(*thread_exit)(struct conf_load *conf, void *thr_data);
 	void			*cookie;
 	char			*format_path;
 	int			nr_jobs;
+	int			nr_decoders;
+	int			nr_stealers;
 	bool			extra_dbg_info;
 	bool			use_obstack;
 	bool			fixup_silly_bitfields;
@@ -190,8 +184,6 @@ void __cus__remove(struct cus *cus, struct cu *cu);
 void cus__remove(struct cus *cus, struct cu *cu);
 
 struct cu *cus__get_next_processable_cu(struct cus *cus);
-
-void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
 
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
@@ -309,7 +301,6 @@ struct cu {
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
-	enum cu_state	 state;
 	uint16_t	 language;
 	unsigned long	 nr_inline_expansions;
 	size_t		 size_inline_expansions;
