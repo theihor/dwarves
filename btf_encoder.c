@@ -128,7 +128,6 @@ struct btf_encoder {
 			  force,
 			  gen_floats,
 			  skip_encoding_decl_tag,
-			  skip_encoding_inconsistent_proto,
 			  tag_kfuncs,
 			  gen_distilled_base;
 	uint32_t	  array_index_id;
@@ -1379,7 +1378,7 @@ static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
 	}
 }
 
-int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
+int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
 {
 	struct btf_encoder_func_state **saved_fns, *s;
 	struct btf_encoder *e = NULL;
@@ -1419,7 +1418,7 @@ int btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
 		 * just do not _use_ them.  Only exclude functions with
 		 * unexpected register use or multiple inconsistent prototypes.
 		 */
-		if (!encoder->skip_encoding_inconsistent_proto ||
+		if (!skip_encoding_inconsistent_proto ||
 		    (!state->unexpected_reg && !state->inconsistent_proto)) {
 			if (btf_encoder__add_func(state->encoder, state)) {
 				free(saved_fns);
@@ -2498,7 +2497,6 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		encoder->force		 = conf_load->btf_encode_force;
 		encoder->gen_floats	 = conf_load->btf_gen_floats;
 		encoder->skip_encoding_decl_tag	 = conf_load->skip_encoding_btf_decl_tag;
-		encoder->skip_encoding_inconsistent_proto = conf_load->skip_encoding_btf_inconsistent_proto;
 		encoder->tag_kfuncs	 = conf_load->btf_decl_tag_kfuncs;
 		encoder->gen_distilled_base = conf_load->btf_gen_distilled_base;
 		encoder->verbose	 = verbose;
