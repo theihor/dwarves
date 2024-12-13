@@ -163,8 +163,6 @@ static struct {
 	/* The mutex only needed for add/delete, as this can happen in
 	 * multiple encoding threads.  A btf_encoder is added to this
 	 * list in btf_encoder__new(), and removed in btf_encoder__delete().
-	 * All encoders except the main one (`btf_encoder` in pahole.c)
-	 * are deleted in pahole_threads_collect().
 	 */
 	pthread_mutex_t btf_encoder_list_lock;
 	struct list_head btf_encoder_list;
@@ -1378,7 +1376,7 @@ static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
 	}
 }
 
-int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
+static int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
 {
 	struct btf_encoder_func_state **saved_fns, *s;
 	struct btf_encoder *e = NULL;
@@ -2168,11 +2166,13 @@ out:
 	return err;
 }
 
-int btf_encoder__encode(struct btf_encoder *encoder)
+int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 {
 	bool should_tag_kfuncs;
 	int err;
 	size_t shndx;
+
+	btf_encoder__add_saved_funcs(conf->skip_encoding_btf_inconsistent_proto);
 
 	for (shndx = 1; shndx < encoder->seccnt; shndx++)
 		if (gobuffer__size(&encoder->secinfo[shndx].secinfo))
