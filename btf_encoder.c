@@ -1326,7 +1326,7 @@ static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
 	}
 }
 
-int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
+static int btf_encoder__add_saved_funcs(bool skip_encoding_inconsistent_proto)
 {
 	struct btf_encoder_func_state **saved_fns, *s;
 	struct btf_encoder *e = NULL;
@@ -2132,11 +2132,13 @@ out:
 	return err;
 }
 
-int btf_encoder__encode(struct btf_encoder *encoder)
+int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 {
 	bool should_tag_kfuncs;
 	int err;
 	size_t shndx;
+
+	btf_encoder__add_saved_funcs(conf->skip_encoding_btf_inconsistent_proto);
 
 	/* for single-threaded case, saved funcs are added here */
 	btf_encoder__add_saved_funcs(encoder);

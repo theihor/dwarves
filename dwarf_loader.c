@@ -3250,24 +3250,20 @@ static void cu__sort_types_by_offset(struct cu *cu, struct conf_load *conf)
 	cu__for_all_tags(cu, type__sort_by_offset, conf);
 }
 
-static int cu__finalize(struct cu *cu, struct cus *cus, struct conf_load *conf, void *thr_data)
+static void cu__finalize(struct cu *cu, struct cus *cus, struct conf_load *conf)
 {
 	cu__for_all_tags(cu, class_member__cache_byte_size, conf);
 
 	if (cu__language_reorders_offsets(cu))
 		cu__sort_types_by_offset(cu, conf);
-
-	cus__set_cu_state(cus, cu, CU__LOADED);
-
-	if (conf && conf->steal) {
-		return conf->steal(cu, conf, thr_data);
-	}
-	return LSK__KEEPIT;
 }
 
-static int cus__finalize(struct cus *cus, struct cu *cu, struct conf_load *conf, void *thr_data)
+static int cus__steal_now(struct cus *cus, struct cu *cu, struct conf_load *conf)
 {
-	int lsk = cu__finalize(cu, cus, conf, thr_data);
+	if (!conf || !conf->steal)
+		return 0;
+
+	int lsk = conf->steal(cu, conf);
 	switch (lsk) {
 	case LSK__DELETE:
 		cus__remove(cus, cu);
@@ -3443,10 +3439,144 @@ struct dwarf_cus {
 	uint32_t	nr_cus_created;
 };
 
-struct dwarf_thread {
-	struct dwarf_cus	*dcus;
-	void			*data;
+/* Multithreading is implemented using a job/worker model.
+ * cus_processing_queue represents a collection of jobs to be
+ * completed by workers.
+ * dwarf_loader__worker_thread is the worker loop, taking jobs from
+ * the queue and executing them.
+ * Implementation of this queue ensures two constraints:
+ *   * JOB_STEAL jobs for a CU are executed in the order of cu->id, as
+ *     a consequence JOB_STEAL jobs always run one at a time.
+ *   * Workers are limited by max_decoded_cus: a worker will not pick
+ *     up a new JOB_DECODE if this limit is exceeded. It'll wait.
+ */
+static struct {
+	pthread_mutex_t mutex;
+	pthread_cond_t job_added;
+	pthread_cond_t job_taken;
+	/* next_cu_id determines the next CU ready to be stealed
+	 * This enforces the order of CU stealing.
+	 */
+	uint32_t next_cu_id;
+	/* max_decoded_cus is a soft limit on the number of JOB_STEAL
+	 * jobs currently in the queue (this number is equal to the
+	 * number of decoded CUs held in memory). It's soft, because a
+	 * worker thread may finish decoding it's current CU after
+	 * this limit has already been reached. In such situation,
+	 * JOB_STEAL with this CU is still added to the queue,
+	 * although a worker will not pick up a new JOB_DECODE.
+	 * So the real hard limit is max_decoded_cus + nr_workers.
+	 * This variable indirectly limits the memory usage.
+	 */
+	uint16_t max_decoded_cus;
+	uint16_t nr_decoded_cus;
+	struct list_head jobs;
+} cus_processing_queue;
+
+enum job_type {
+	JOB_NONE = 0,
+	JOB_DECODE = 1,
+	JOB_STEAL = 2,
 };
+
+struct cu_processing_job {
+	struct list_head node;
+	enum job_type type;
+	struct cu *cu; /* for stealing jobs */
+};
+
+static void cus_queue__init(uint16_t max_decoded_cus)
+{
+	pthread_mutex_init(&cus_processing_queue.mutex, NULL);
+	pthread_cond_init(&cus_processing_queue.job_added, NULL);
+	pthread_cond_init(&cus_processing_queue.job_taken, NULL);
+	INIT_LIST_HEAD(&cus_processing_queue.jobs);
+	cus_processing_queue.max_decoded_cus = max_decoded_cus;
+	cus_processing_queue.nr_decoded_cus = 0;
+	cus_processing_queue.next_cu_id = 0;
+}
+
+static void cus_queue__destroy(void)
+{
+	pthread_mutex_destroy(&cus_processing_queue.mutex);
+	pthread_cond_destroy(&cus_processing_queue.job_added);
+	pthread_cond_destroy(&cus_processing_queue.job_taken);
+}
+
+static inline void cus_queue__inc_next_cu_id(void)
+{
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	cus_processing_queue.next_cu_id++;
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+}
+
+static void cus_queue__enqueue_job(struct cu_processing_job *job)
+{
+	if (job == NULL)
+		return;
+
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+
+	/* JOB_STEAL have higher priority, add them to the head so
+	 * they can be found faster
+	 */
+	if (job->type == JOB_STEAL) {
+		list_add(&job->node, &cus_processing_queue.jobs);
+		cus_processing_queue.nr_decoded_cus++;
+	} else {
+		list_add_tail(&job->node, &cus_processing_queue.jobs);
+	}
+
+	pthread_cond_signal(&cus_processing_queue.job_added);
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+}
+
+static struct cu_processing_job *cus_queue__dequeue_job(void)
+{
+	struct cu_processing_job *job, *dequeued_job = NULL;
+	struct list_head *pos, *tmp;
+
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	while (list_empty(&cus_processing_queue.jobs))
+		pthread_cond_wait(&cus_processing_queue.job_added, &cus_processing_queue.mutex);
+
+	/* First, try to find JOB_STEAL for the next CU */
+	list_for_each_safe(pos, tmp, &cus_processing_queue.jobs) {
+		job = list_entry(pos, struct cu_processing_job, node);
+		if (job->type == JOB_STEAL && job->cu->id == cus_processing_queue.next_cu_id) {
+			list_del(&job->node);
+			cus_processing_queue.nr_decoded_cus--;
+			dequeued_job = job;
+			break;
+		}
+	}
+
+	/* If no JOB_STEAL is found, check if we are allowed to decode
+	 * more CUs.  If not, it means that the CU with next_cu_id is
+	 * still being decoded while the queue is "full". Wait.
+	 * job_taken will signal that another thread was able to pick
+	 * up a JOB_STEAL, so we might be able to proceed with JOB_DECODE.
+	 */
+	if (dequeued_job == NULL) {
+		while (cus_processing_queue.nr_decoded_cus >= cus_processing_queue.max_decoded_cus)
+			pthread_cond_wait(&cus_processing_queue.job_taken, &cus_processing_queue.mutex);
+
+		/* We can decode now. */
+		list_for_each_safe(pos, tmp, &cus_processing_queue.jobs) {
+			job = list_entry(pos, struct cu_processing_job, node);
+			if (job->type == JOB_DECODE) {
+				list_del(&job->node);
+				dequeued_job = job;
+				break;
+			}
+		}
+	}
+
+	pthread_cond_signal(&cus_processing_queue.job_taken);
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+
+	return dequeued_job;
+}
 
 static struct dwarf_cu *dwarf_cus__create_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die, uint8_t pointer_size)
 {
@@ -3477,28 +3607,6 @@ static struct dwarf_cu *dwarf_cus__create_cu(struct dwarf_cus *dcus, Dwarf_Die *
 	dcus->nr_cus_created++;
 
 	return dcu;
-}
-
-static int dwarf_cus__process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die,
-				 struct cu *cu, void *thr_data)
-{
-	if (die__process_and_recode(cu_die, cu, dcus->conf) != 0 ||
-	    cus__finalize(dcus->cus, cu, dcus->conf, thr_data) == LSK__STOP_LOADING)
-		return DWARF_CB_ABORT;
-
-       return DWARF_CB_OK;
-}
-
-static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *cu_die, uint8_t pointer_size)
-{
-	struct dwarf_cu *dcu = dwarf_cus__create_cu(dcus, cu_die, pointer_size);
-
-	if (dcu == NULL)
-		return DWARF_CB_ABORT;
-
-	cus__add(dcus->cus, dcu->cu);
-
-	return dwarf_cus__process_cu(dcus, cu_die, dcu->cu, NULL);
 }
 
 static int dwarf_cus__nextcu(struct dwarf_cus *dcus, struct dwarf_cu **dcu,
@@ -3541,24 +3649,86 @@ out_unlock:
 	return ret;
 }
 
-static void *dwarf_cus__process_cu_thread(void *arg)
+static struct cu *dwarf_loader__decode_next_cu(struct dwarf_cus *dcus)
 {
-	struct dwarf_thread *dthr = arg;
-	struct dwarf_cus *dcus = dthr->dcus;
 	uint8_t pointer_size, offset_size;
+	struct dwarf_cu *dcu = NULL;
 	Dwarf_Die die_mem, *cu_die;
-	struct dwarf_cu *dcu;
+	int err;
 
-	while (dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size) == 0) {
-		if (cu_die == NULL)
+	err = dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size);
+
+	if (err < 0)
+		goto out_error;
+	else if (err == 1) /* no more CUs */
+		return NULL;
+
+	err = die__process_and_recode(cu_die, dcu->cu, dcus->conf);
+	if (err)
+		goto out_error;
+	if (cu_die == NULL)
+		return NULL;
+
+	cu__finalize(dcu->cu, dcus->cus, dcus->conf);
+
+	return dcu->cu;
+
+out_error:
+	dcus->error = err;
+	fprintf(stderr, "error decoding cu %s\n", dcu && dcu->cu ? dcu->cu->name : "");
+	return NULL;
+}
+
+static void *dwarf_loader__worker_thread(void *arg)
+{
+	struct cu_processing_job *job;
+	struct dwarf_cus *dcus = arg;
+	bool stop = false;
+	struct cu *cu;
+
+	while (!stop) {
+		job = cus_queue__dequeue_job();
+
+		switch (job->type) {
+
+		case JOB_DECODE:
+			cu = dwarf_loader__decode_next_cu(dcus);
+
+			if (cu == NULL) {
+				free(job);
+				stop = true;
+				break;
+			}
+
+			/* Create and enqueue a new JOB_STEAL for this decoded CU */
+			struct cu_processing_job *steal_job = calloc(1, sizeof(*steal_job));
+
+			steal_job->type = JOB_STEAL;
+			steal_job->cu = cu;
+			cus_queue__enqueue_job(steal_job);
+
+			/* re-enqueue JOB_DECODE so that next CU is decoded from DWARF */
+			cus_queue__enqueue_job(job);
 			break;
 
-		if (dwarf_cus__process_cu(dcus, cu_die, dcu->cu, dthr->data) == DWARF_CB_ABORT)
+		case JOB_STEAL:
+			if (cus__steal_now(dcus->cus, job->cu, dcus->conf) == LSK__STOP_LOADING)
+				goto out_abort;
+			cus_queue__inc_next_cu_id();
+			/* Free the job struct as it's no longer
+			 * needed after CU has been stolen.
+			 * dwarf_loader work for this CU is done.
+			 */
+			free(job);
+			break;
+
+		default:
+			fprintf(stderr, "Unknown dwarf_loader job type %d\n", job->type);
 			goto out_abort;
+		}
 	}
 
-	if (dcus->conf->thread_exit &&
-	    dcus->conf->thread_exit(dcus->conf, dthr->data) != 0)
+	if (dcus->error)
 		goto out_abort;
 
 	return (void *)DWARF_CB_OK;
@@ -3566,29 +3736,29 @@ out_abort:
 	return (void *)DWARF_CB_ABORT;
 }
 
-static int dwarf_cus__threaded_process_cus(struct dwarf_cus *dcus)
+static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
 {
-	pthread_t threads[dcus->conf->nr_jobs];
-	struct dwarf_thread dthr[dcus->conf->nr_jobs];
-	void *thread_data[dcus->conf->nr_jobs];
-	int res;
-	int i;
+	int nr_workers = dcus->conf->nr_jobs > 0 ? dcus->conf->nr_jobs : 1;
+	pthread_t workers[nr_workers];
+	struct cu_processing_job *job;
 
-	if (dcus->conf->threads_prepare) {
-		res = dcus->conf->threads_prepare(dcus->conf, dcus->conf->nr_jobs, thread_data);
-		if (res != 0)
-			return res;
-	} else {
-		memset(thread_data, 0, sizeof(void *) * dcus->conf->nr_jobs);
+	cus_queue__init(nr_workers * 4);
+
+	/* fill up the queue with nr_workers JOB_DECODE jobs */
+	for (int i = 0; i < nr_workers; i++) {
+		job = calloc(1, sizeof(*job));
+		job->type = JOB_DECODE;
+		/* no need for locks, workers were not started yet */
+		list_add(&job->node, &cus_processing_queue.jobs);
 	}
 
-	for (i = 0; i < dcus->conf->nr_jobs; ++i) {
-		dthr[i].dcus = dcus;
-		dthr[i].data = thread_data[i];
+	if (dcus->error)
+		return dcus->error;
 
-		dcus->error = pthread_create(&threads[i], NULL,
-					     dwarf_cus__process_cu_thread,
-					     &dthr[i]);
+	for (int i = 0; i < nr_workers; ++i) {
+		dcus->error = pthread_create(&workers[i], NULL,
+					     dwarf_loader__worker_thread,
+					     dcus);
 		if (dcus->error)
 			goto out_join;
 	}
@@ -3596,52 +3766,17 @@ static int dwarf_cus__threaded_process_cus(struct dwarf_cus *dcus)
 	dcus->error = 0;
 
 out_join:
-	while (--i >= 0) {
+	for (int i = 0; i < nr_workers; ++i) {
 		void *res;
-		int err = pthread_join(threads[i], &res);
+		int err = pthread_join(workers[i], &res);
 
 		if (err == 0 && res != NULL)
 			dcus->error = (long)res;
 	}
 
-	if (dcus->conf->threads_collect) {
-		res = dcus->conf->threads_collect(dcus->conf, dcus->conf->nr_jobs,
-						  thread_data, dcus->error);
-		if (dcus->error == 0)
-			dcus->error = res;
-	}
+	cus_queue__destroy();
 
 	return dcus->error;
-}
-
-static int __dwarf_cus__process_cus(struct dwarf_cus *dcus)
-{
-	uint8_t pointer_size, offset_size;
-	Dwarf_Off noff;
-	size_t cuhl;
-
-	while (dwarf_nextcu(dcus->dw, dcus->off, &noff, &cuhl, NULL, &pointer_size, &offset_size) == 0) {
-		Dwarf_Die die_mem;
-		Dwarf_Die *cu_die = dwarf_offdie(dcus->dw, dcus->off + cuhl, &die_mem);
-
-		if (cu_die == NULL)
-			break;
-
-		if (dwarf_cus__create_and_process_cu(dcus, cu_die, pointer_size) == DWARF_CB_ABORT)
-			return DWARF_CB_ABORT;
-
-		dcus->off = noff;
-	}
-
-	return 0;
-}
-
-static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
-{
-	if (dcus->conf->nr_jobs > 1)
-		return dwarf_cus__threaded_process_cus(dcus);
-
-	return __dwarf_cus__process_cus(dcus);
 }
 
 static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
@@ -3733,7 +3868,8 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 	if (cu__resolve_func_ret_types_optimized(cu) != LSK__KEEPIT)
 		goto out_abort;
 
-	if (cus__finalize(cus, cu, conf, NULL) == LSK__STOP_LOADING)
+	cu__finalize(cu, cus, conf);
+	if (cus__steal_now(cus, cu, conf) == LSK__STOP_LOADING)
 		goto out_abort;
 
 	return 0;
@@ -3765,7 +3901,8 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 	}
 
 	if (type_cu != NULL) {
-		type_lsk = cu__finalize(type_cu, cus, conf, NULL);
+		cu__finalize(type_cu, cus, conf);
+		type_lsk = cus__steal_now(cus, type_cu, conf);
 		if (type_lsk == LSK__DELETE) {
 			cus__remove(cus, type_cu);
 		}
@@ -3787,6 +3924,7 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 			.type_dcu = type_cu ? &type_dcu : NULL,
 			.build_id = build_id,
 			.build_id_len = build_id_len,
+			.nr_cus_created = 0,
 		};
 		res = dwarf_cus__process_cus(&dcus);
 	}
