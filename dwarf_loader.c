@@ -3263,7 +3263,12 @@ static int cus__steal_now(struct cus *cus, struct cu *cu, struct conf_load *conf
 	if (!conf || !conf->steal)
 		return 0;
 
+	// printf("stealing cu %d\n", cu->id);
+
 	int lsk = conf->steal(cu, conf);
+
+	// printf("stolen cu %d\n", cu->id);
+
 	switch (lsk) {
 	case LSK__DELETE:
 		cus__remove(cus, cu);
@@ -3515,314 +3520,202 @@ out_unlock:
 	return ret;
 }
 
-/*
-	Multithreading in dwarf_cus__process_cus() is controlled by dcus->conf
-
-	conf->steal is a function processing each decoded CU
-	conf->nr_stealers controls the number of stealer threads
-	conf->nr_dwarf_decoders controls the number of threads that decode CUs from dwarf
-
-	Obviously, it's expected that:
-		* conf->nr_decoders > 0
-		* conf->nr_stealers > 0
-		* conf->nr_stealers + conf->nr_decoders <= conf->nr_jobs
-	If invalid values are passed, we fall back to a single thread.
-
-	A decoder thread is runs a loop taking dwarf_cus__nextcu() and decoding it
-	with dward_cus__process_cu(). Then, it adds a decoded CU to the queue.
-
-	A stealer thread calls conf->steal() in a loop "stealing" CUs from the queue.
-
-	Decoders and stealers communicate via cus_processing_queue,
-	a data structure internal to dwarf_loader. The queue uses a condition
-	variable for synchronization between decoders and stealers.
-
-	The cus_processing_queue ensures that stealers take the CUs in
-	the order of cu->id, independent of the order in which the
-	decoders decode them. Implementation relies on the all CU ids
-	being a sequence of consecutive numbers starting from 0.
-
-	cus_processing_queue max size is also bounded in order to limit memory usage.
-
-	Steal function return values are respected:
-		* LSK__KEEPIT will ensure that the CU data is not freed
-		* LSK__DELETE will free the CU data
-		* LSK__STOP_LOADING will stop all the threads by clearing the queue
-*/
-static struct {
-	pthread_mutex_t mutex;
-	pthread_cond_t decoder_go;
-	pthread_cond_t stealer_go;
-	uint32_t next_cu_id; /* next_cu_id determines the next CU ready to be dequeued */
-	uint32_t nr_cus;
-	uint32_t max_nr_cus;
-	struct cu **cu;
-} cus_processing_queue;
-
-static int cus_queue__init(uint32_t max_queue_size)
-{
-	pthread_mutex_init(&cus_processing_queue.mutex, NULL);
-	pthread_cond_init(&cus_processing_queue.decoder_go, NULL);
-	pthread_cond_init(&cus_processing_queue.stealer_go, NULL);
-	cus_processing_queue.cu = malloc(max_queue_size * sizeof(*cus_processing_queue.cu));
-	if (cus_processing_queue.cu == NULL) {	
-		fprintf(stderr, "malloc() failed for cus_processing_queue\n");
-		return -ENOMEM;
-	}
-	cus_processing_queue.max_nr_cus = max_queue_size;
-	cus_processing_queue.nr_cus = 0;
-	cus_processing_queue.next_cu_id = 0;
-
-	return 0;
-}
-
-static inline bool __cu_queue__is_full()
-{
-	return cus_processing_queue.nr_cus >= cus_processing_queue.max_nr_cus;
-}
-
-static inline bool __cu_queue__is_empty()
-{
-	return cus_processing_queue.nr_cus == 0;
-}
-
-/* Decoder can only add a CU to the queue if it's not full
-   AND the cu->id is in range [next_cu_id, next_cu_id + max_nr_cus - 1]
-   
-   cu->id range constraint is important to avoid a potential corner
-   case: while the first big CU is being decoded the queue gets filled up
-   by CUs with bigger ids, and the stealer ends up waiting forever.
-   */
-static inline bool __cu_queue__can_enqueue(uint32_t cu_id) {
-	printf("%d <= %d < %d + %d\n", cus_processing_queue.next_cu_id, 
-	cu_id, cus_processing_queue.next_cu_id, cus_processing_queue.max_nr_cus);
-	return !__cu_queue__is_full()
-			&& cu_id >= cus_processing_queue.next_cu_id
-			&& cu_id < cus_processing_queue.next_cu_id + cus_processing_queue.max_nr_cus - 1;
-}
-
-static void cu_queue__enqueue_decoded_cu(struct cu *cu)
-{
-	pthread_mutex_lock(&cus_processing_queue.mutex);
-	while(!__cu_queue__can_enqueue(cu->id)) {
-		printf("(");
-		for (int k = 0; k < cus_processing_queue.nr_cus; k++)
-			printf("%d ", cus_processing_queue.cu[k]->id);
-		printf(")\n");
-		printf("decoder went to sleep waiting with cu %d\n", cu->id);
-		pthread_cond_wait(&cus_processing_queue.decoder_go, &cus_processing_queue.mutex);
-	}
-
-	/* Proceed with enqueuing */
-	// printf("enq cu %d\n", cu->id);
-	// printf("  (");
-	// for (int k = 0; k < cus_processing_queue.nr_cus; k++)
-	// 	printf("%d ", cus_processing_queue.cu[k]->id);
-	// printf(") -> ");
-
-	cus_processing_queue.cu[cus_processing_queue.nr_cus++] = cu;
-
-	/* Notify stealers that a new cu has been decoded */
-	pthread_cond_signal(&cus_processing_queue.stealer_go);
-	pthread_mutex_unlock(&cus_processing_queue.mutex);
-}
-
-/* Only a CU with id == next_cu_id can be dequeued */
-static inline struct cu *__cu_queue__dequeue() {	
-	for (int i = 0; i < cus_processing_queue.nr_cus; i++) {
-		if (cus_processing_queue.cu[i]->id == cus_processing_queue.next_cu_id) {
-			
-			// printf("deq cu %d\n", cus_processing_queue.cu[i]->id);
-
-			// printf("  (");
-			// for (int k = 0; k < cus_processing_queue.nr_cus; k++)
-			// 	printf("%d ", cus_processing_queue.cu[k]->id);
-			// printf(") -> ");
-			
-			struct cu *cu = cus_processing_queue.cu[i];
-			cus_processing_queue.cu[i] = NULL;
-			/* shift all elements to the beginning of the array */
-			for (int j = i; j < cus_processing_queue.max_nr_cus - 1; j++)
-				cus_processing_queue.cu[j] = cus_processing_queue.cu[j + 1];
-			
-			cus_processing_queue.nr_cus--;
-			cus_processing_queue.next_cu_id++;
-
-			// printf("(");
-			// for (int k = 0; k < cus_processing_queue.nr_cus; k++)
-			// 	printf("%d ", cus_processing_queue.cu[k]->id);
-			// printf(")\n");
-
-			return cu;
-		}
-	}
-	return NULL;
-}
-
-/*
-static struct cu *cu_queue__dequeue_decoded_cu() {
-	struct cu *cu;
-
-	pthread_mutex_lock(&cus_processing_queue.mutex);
-	// printf("before deq attempt: (");
-	// for (int k = 0; k < cus_processing_queue.nr_cus; k++)
-	// 	printf("%d ", cus_processing_queue.cu[k]->id);
-	// printf(")\n");
-	
-	while ((cu = __cu_queue__dequeue()) == NULL) {
-		printf("stealer went to sleep waiting for a cu %d\n", cus_processing_queue.next_cu_id);
-		pthread_cond_wait(&cus_processing_queue.cu_ready, &cus_processing_queue.mutex);
-	}
-	pthread_cond_signal(&cus_processing_queue.cu_stealed);
-	pthread_mutex_unlock(&cus_processing_queue.mutex);
-	return cu;
-}
-*/
-
-static struct cu *dwarf_decoder__decode_next_cu(struct dwarf_cus *dcus)
+static struct cu *dwarf_loader__decode_next_cu(struct dwarf_cus *dcus)
 {
 	uint8_t pointer_size, offset_size;
-	struct dwarf_cu *dcu = NULL;
-	Dwarf_Die *cu_die = NULL;
-	Dwarf_Die die_mem;
+	Dwarf_Die die_mem, *cu_die;
+	struct dwarf_cu *dcu;
+	int err;
 
-	int ret = dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size);
-	if (ret < 0)
+	err = dwarf_cus__nextcu(dcus, &dcu, &die_mem, &cu_die, &pointer_size, &offset_size);
+
+	if (err < 0)
 		goto out_error;
-	
-	if (dcus->cus_exhausted)
+	else if (err == 1) /* no more CUs */
 		return NULL;
-
-	if (die__process_and_recode(cu_die, dcu->cu, dcus->conf) != 0)
-		goto out_error;
 	
-	cu__finalize(dcu->cu, dcus->cus, dcus->conf);
+	// printf("decoding cu %d\n", dcu->cu->id);
 
+	err = die__process_and_recode(cu_die, dcu->cu, dcus->conf);
+	if (cu_die == NULL)
+		return NULL;
+	
+	if (err)
+		goto out_error;
+
+	cu__finalize(dcu->cu, dcus->cus, dcus->conf);
+	
 	return dcu->cu;
 
 out_error:
-	dcus->error = ret;
-	fprintf(stderr, "error decoding cu %s\n", dcu->cu->name);
+	dcus->error = err;
+	fprintf(stderr, "error decoding cu %s\n", dcu && dcu->cu ? dcu->cu->name : "");
 	return NULL;
 }
 
-static void* dwarf_decoder__thread(void *arg)
-{
-	struct dwarf_cus *dcus = arg;
-	while (true) {
-		struct cu *cu = dwarf_decoder__decode_next_cu(dcus);
+static struct {
+	pthread_mutex_t mutex;
+	pthread_cond_t job_added;
+	pthread_cond_t job_taken;
+	/* next_cu_id determines the next CU ready to be stealed 
+     * This enforces the order of CU stealing.
+	 */
+	uint32_t next_cu_id;
+	/* max_decoded_cus is the maximum number of decoded CUs that can be held in memory, 
+	 * which equals to the number of JOB_STEAL jobs currently in the queue.
+	 * This indirectly limits the memory usage.
+	 */
+	uint16_t max_decoded_cus;
+	uint16_t nr_decoded_cus;
+	struct list_head jobs;
+} cus_processing_queue;
 
-		if (dcus->cus_exhausted)
+enum job_type {
+	JOB_NONE = 0,
+	JOB_DECODE = 1,
+	JOB_STEAL = 2,
+};
+
+struct cu_processing_job {
+	struct list_head node;
+	enum job_type type;
+	struct cu *cu; /* for stealing jobs */
+};
+
+static void cus_queue__init(uint16_t max_decoded_cus)
+{
+	pthread_mutex_init(&cus_processing_queue.mutex, NULL);
+	pthread_cond_init(&cus_processing_queue.job_added, NULL);
+	pthread_cond_init(&cus_processing_queue.job_taken, NULL);
+	INIT_LIST_HEAD(&cus_processing_queue.jobs);
+	cus_processing_queue.max_decoded_cus = max_decoded_cus;
+	cus_processing_queue.nr_decoded_cus = 0;
+	cus_processing_queue.next_cu_id = 0;
+}
+
+static inline void cus_queue__inc_next_cu_id()
+{
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	cus_processing_queue.next_cu_id++;
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+}
+
+static void cus_queue__enqueue_job(struct cu_processing_job *job)
+{
+	if (job == NULL)
+		return;
+
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	list_add_tail(&job->node, &cus_processing_queue.jobs);
+	if (job->type == JOB_STEAL)
+		cus_processing_queue.nr_decoded_cus++;
+	pthread_cond_signal(&cus_processing_queue.job_added);
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+
+	// printf("enq %s job for CU %d\n", 
+	// 		job->type == JOB_DECODE ? "decode" : "steal",
+	// 		job && job->cu ? job->cu->id : -1);
+}
+
+static struct cu_processing_job *cus_queue__dequeue_job()
+{
+	struct cu_processing_job *job, *dequeued_job = NULL;
+	struct list_head *pos, *tmp;
+
+	pthread_mutex_lock(&cus_processing_queue.mutex);
+	while (list_empty(&cus_processing_queue.jobs))
+		pthread_cond_wait(&cus_processing_queue.job_added, &cus_processing_queue.mutex);
+
+	/* First, try to find a steal job for the next CU */
+	list_for_each_safe(pos, tmp, &cus_processing_queue.jobs) {
+		job = list_entry(pos, struct cu_processing_job, node);
+		if (job->type == JOB_STEAL) {
+			if (job->cu->id == cus_processing_queue.next_cu_id) {
+				list_del(&job->node);
+				cus_processing_queue.nr_decoded_cus--;
+				dequeued_job = job;
+				break;
+			}
+		}
+	}
+
+	if (dequeued_job == NULL) {
+		/* If no steal job found, check if we are allowed to decode more CUs.
+		   If not, wait for other threads to steal some decoded CUs. */
+		while (cus_processing_queue.nr_decoded_cus >= cus_processing_queue.max_decoded_cus)
+			pthread_cond_wait(&cus_processing_queue.job_taken, &cus_processing_queue.mutex);
+
+		/* We can decode now. */
+		list_for_each_safe(pos, tmp, &cus_processing_queue.jobs) {
+			job = list_entry(pos, struct cu_processing_job, node);
+			if (job->type == JOB_DECODE) {
+				list_del(&job->node);
+				dequeued_job = job;
+				break;
+			}
+		}
+	}
+
+	pthread_cond_signal(&cus_processing_queue.job_taken);
+	pthread_mutex_unlock(&cus_processing_queue.mutex);
+
+	return dequeued_job;
+}
+
+static void* dwarf_loader__worker_thread(void *arg)
+{
+	struct cu_processing_job *job;
+	struct dwarf_cus *dcus = arg;
+	bool stop = false;
+	struct cu *cu;
+
+	while (!stop) {
+		job = cus_queue__dequeue_job();
+		// printf("deq %s job for CU %d\n", 
+		// 		job->type == JOB_DECODE ? "decode" : "steal",
+		// 		job && job->cu ? job->cu->id : -1);
+
+		switch (job->type) {
+		
+		case JOB_DECODE:
+			cu = dwarf_loader__decode_next_cu(dcus);
+			
+			if (cu == NULL) {
+				free(job);
+				stop = true;
+				break;
+			}
+
+			// printf("decoded CU %d\n", cu->id);
+
+			/* Create and enqueue a new JOB_STEAL for this decoded CU */
+			struct cu_processing_job *steal_job = calloc(1, sizeof(*steal_job));
+			steal_job->type = JOB_STEAL;
+			steal_job->cu = cu;
+			cus_queue__enqueue_job(steal_job);
+
+			/* re-enqueue JOB_DECODE so that next CU is decoded from DWARF */
+			cus_queue__enqueue_job(job);
+			break;
+
+		case JOB_STEAL:
+			if (cus__steal_now(dcus->cus, job->cu, dcus->conf) == LSK__STOP_LOADING)
+				goto out_abort;
+			cus_queue__inc_next_cu_id();
+			/* free the job struct as it's no longer needed
+			   after CU has been stolen; dwarf_loader work is done
+			 */
+			free(job);
 			break;
 		
-		if (cu == NULL)
+		default:
+			fprintf(stderr, "Unknown dwarf_loader job type %d\n", job->type);
 			goto out_abort;
-
-		if (dcus->conf && dcus->conf->steal) {
-			cu_queue__enqueue_decoded_cu(cu);
 		}
 	}
 
-	return (void *)DWARF_CB_OK;
-
-out_abort:
-	return (void *)DWARF_CB_ABORT;
-}
-
-/*
-static void* cu_stealer__thread(void *arg)
-{
-	struct dwarf_cus *dcus = arg;
-	while (true) {
-		struct cu *cu = cu_queue__dequeue_decoded_cu();
-
-		if (cus__steal_now(dcus->cus, cu, dcus->conf) == LSK__STOP_LOADING)
-			goto out_abort;
-
-		cus__lock(dcus->cus);
-		bool stop_loading = dcus->cus_exhausted && cus_processing_queue.next_cu_id >= dcus->nr_cus_created;
-		cus__unlock(dcus->cus);
-
-		if (stop_loading)
-			break;
-	}
-
-	return (void *)DWARF_CB_OK;
-
-out_abort:
-	return (void *)DWARF_CB_ABORT;
-}
-*/
-
-/* A smart stealer becomes becomes a decoder in when it has nothing to do.
-   After decoding a single cu, it will try to steal again.
- */
-static void* cu_smart_stealer__thread(void *arg)
-{
-	struct dwarf_cus *dcus = arg;
-	bool stop_loading = false;
-	struct cu *cu;
-	
-	while (!stop_loading) {
-
-		pthread_mutex_lock(&cus_processing_queue.mutex);
-
-		/* Check if there is a cu to steal. 
-		   If not, become a decoder for one iteration, then try again. */
-		if ((cu = __cu_queue__dequeue()) == NULL) {
-			pthread_mutex_unlock(&cus_processing_queue.mutex);
-
-			cu = dwarf_decoder__decode_next_cu(dcus);
-			if (cu == NULL)
-				goto out_abort;
-			
-			printf("smart stealer has decoded cu %d\n", cu->id);
-
-			pthread_mutex_lock(&cus_processing_queue.mutex);
-			if (__cu_queue__is_full()) {
-				/* While smart stealer was decoding, the queue might have been filled up.
-				   This is "put an elephant in the fridge" situation.
-				   We need to lock the queue, take out a CU for stealing,
-				   and then put recently decoded CU in the queue.*/
-				struct cu *tmp = __cu_queue__dequeue();
-				if (tmp == NULL) {
-					/* panic, this is not supposed to happen */
-					fprintf(stderr, "cu_processing_queue is full, but there is no expected cu in it");
-					dcus->error = -1;
-					pthread_mutex_unlock(&cus_processing_queue.mutex);
-					goto out_abort;
-				}
-				cus_processing_queue.cu[cus_processing_queue.nr_cus++] = cu;
-				cu = tmp;
-			} else {
-				
-				/* FIXME!!!: smart stealer can break a constraint of the cu_id range leading to a deadlock */
-				
-				/* Queue is not full, just add the new cu to it. */
-				cus_processing_queue.cu[cus_processing_queue.nr_cus++] = cu;
-				cu = __cu_queue__dequeue();
-			}
-			/* No need to release the mutex here.
-			   It's released further down either by cond_wait or unlock 
-			*/
-		}
-
-		/* do the stealing */
-		while (cu == NULL) {
-			printf("smart stealer went to sleep waiting for a cu %d\n", cus_processing_queue.next_cu_id);
-			pthread_cond_wait(&cus_processing_queue.stealer_go, &cus_processing_queue.mutex);
-			cu = __cu_queue__dequeue();
-		}
-		pthread_cond_signal(&cus_processing_queue.decoder_go);
-		pthread_mutex_unlock(&cus_processing_queue.mutex);
-
-		if (cus__steal_now(dcus->cus, cu, dcus->conf) == LSK__STOP_LOADING)
-			return (void *)DWARF_CB_ABORT;
-
-		cus__lock(dcus->cus);
-		stop_loading = dcus->cus_exhausted && cus_processing_queue.next_cu_id >= dcus->nr_cus_created;
-		cus__unlock(dcus->cus);
-	}
+	if (dcus->error)
+		goto out_abort;
 
 	return (void *)DWARF_CB_OK;
 
@@ -3838,25 +3731,24 @@ static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
 		exit(1);
 	}
 
-	pthread_t decoders[dcus->conf->nr_decoders];
-	pthread_t stealers[dcus->conf->nr_stealers];
+	pthread_t workers[dcus->conf->nr_jobs];
 
-	dcus->error = cus_queue__init(dcus->conf->nr_jobs);
+	cus_queue__init(dcus->conf->nr_jobs * 4);
+	/* fill up the queue with nr_jobs JOB_DECODE jobs */
+	for (int i = 0; i < dcus->conf->nr_jobs; i++) {
+		struct cu_processing_job *job = calloc(1, sizeof(*job));
+		job->type = JOB_DECODE;
+		/* no need for locks, workers were not started yet */
+		list_add_tail(&job->node, &cus_processing_queue.jobs);
+	}
+
 	if (dcus->error)
 		return dcus->error;
 
-	for (int i = 0; i < dcus->conf->nr_decoders; ++i) {
-		dcus->error = pthread_create(&decoders[i], NULL,
-					     dwarf_decoder__thread,
+	for (int i = 0; i < dcus->conf->nr_jobs; ++i) {
+		dcus->error = pthread_create(&workers[i], NULL,
+					     dwarf_loader__worker_thread,
 					     dcus);
-		if (dcus->error)
-			goto out_join;
-	}
-
-	for (int i = 0; i < dcus->conf->nr_stealers; ++i) {
-		dcus->error = pthread_create(&stealers[i], NULL,
-						cu_smart_stealer__thread,
-						dcus);
 		if (dcus->error)
 			goto out_join;
 	}
@@ -3864,18 +3756,9 @@ static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
 	dcus->error = 0;
 
 out_join:
-	void* res;
-	int err;
-
-	for (int i = 0; i < dcus->conf->nr_decoders; ++i) {
-		err = pthread_join(decoders[i], &res);
-
-		if (err == 0 && res != NULL)
-			dcus->error = (long)res;
-	}
-
-	for (int i = 0; i < dcus->conf->nr_stealers; ++i) {
-		err = pthread_join(stealers[i], &res);
+	for (int i = 0; i < dcus->conf->nr_jobs; ++i) {
+		void *res;
+		int err = pthread_join(workers[i], &res);
 
 		if (err == 0 && res != NULL)
 			dcus->error = (long)res;
