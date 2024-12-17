@@ -23,15 +23,17 @@ enum btf_var_option {
 	BTF_VAR_GLOBAL = 2,
 };
 
+int btf_encoding_context__init(void);
+void btf_encoding_context__exit(void);
+
 struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool verbose, struct conf_load *conf_load);
 void btf_encoder__delete(struct btf_encoder *encoder);
 
-int btf_encoder__encode(struct btf_encoder *encoder);
-
+int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf);
 int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct conf_load *conf_load);
 
 struct btf *btf_encoder__btf(struct btf_encoder *encoder);
 
-int btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder *other);
+int btf_encoder__pre_load_module(Dwfl_Module *mod, Elf *elf);
 
 #endif /* _BTF_ENCODER_H_ */
