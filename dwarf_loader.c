@@ -3666,10 +3666,23 @@ static void *dwarf_loader__worker_thread(void *arg)
 
 			job->type = JOB_STEAL;
 			job->cu = cu;
+
+			/* If the current CU is the next CU to be stealed,
+			 * then there is no reason to put it in the queue, just steal.
+			 */
+			bool is_next_cu_id = false;
+			pthread_mutex_lock(&cus_processing_queue.mutex);
+			is_next_cu_id = cus_processing_queue.next_cu_id == cu->id;
+			pthread_mutex_unlock(&cus_processing_queue.mutex);
+
+			if (is_next_cu_id)
+				goto steal_cu;
+			
 			cus_queue__enqueue_job(job);
 			break;
 
 		case JOB_STEAL:
+steal_cu:
 			if (cus__steal_now(dcus->cus, job->cu, dcus->conf) == LSK__STOP_LOADING)
 				goto out_abort;
 			cus_queue__inc_next_cu_id();
