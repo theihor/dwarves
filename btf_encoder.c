@@ -100,6 +100,13 @@ struct elf_secinfo {
 	struct gobuffer secinfo;
 };
 
+struct kfunc_info {
+	struct list_head node;
+	uint32_t id;
+	uint32_t flags;
+	char* name;
+};
+
 struct elf_functions {
 	struct list_head node; /* for elf_functions_list */
 	Elf *elf; /* source ELF */
@@ -138,6 +145,7 @@ struct btf_encoder {
 		int cnt;
 		int cap;
 	} func_states;
+	struct list_head  kfuncs; /* list of kfunc_info */
 	/* This is a list of elf_functions tables, one per ELF.
 	 * Multiple ELF modules can be processed in one pahole run,
 	 * so we have to store elf_functions tables per ELF.
@@ -1842,9 +1850,9 @@ static int btf__add_kfunc_decl_tag(struct btf *btf, const char *tag, __u32 id, c
 	return 0;
 }
 
-static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *funcs, const char *kfunc, __u32 flags)
+static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *funcs, const struct kfunc_info *kfunc)
 {
-	struct btf_func key = { .name = kfunc };
+	struct btf_func key = { .name = kfunc->name };
 	struct btf *btf = encoder->btf;
 	struct btf_func *target;
 	const void *base;
@@ -1855,7 +1863,7 @@ static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *
 	cnt = gobuffer__nr_entries(funcs);
 	target = bsearch(&key, base, cnt, sizeof(key), btf_func_cmp);
 	if (!target) {
-		fprintf(stderr, "%s: failed to find kfunc '%s' in BTF\n", __func__, kfunc);
+		fprintf(stderr, "%s: failed to find kfunc '%s' in BTF\n", __func__, kfunc->name);
 		return -1;
 	}
 
@@ -1864,11 +1872,12 @@ static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *
 	 * We are ok to do this b/c we will later btf__dedup() to remove
 	 * any duplicates.
 	 */
-	err = btf__add_kfunc_decl_tag(btf, BTF_KFUNC_TYPE_TAG, target->type_id, kfunc);
+	err = btf__add_kfunc_decl_tag(btf, BTF_KFUNC_TYPE_TAG, target->type_id, kfunc->name);
 	if (err < 0)
 		return err;
-	if (flags & KF_FASTCALL) {
-		err = btf__add_kfunc_decl_tag(btf, BTF_FASTCALL_TAG, target->type_id, kfunc);
+
+	if (kfunc->flags & KF_FASTCALL) {
+		err = btf__add_kfunc_decl_tag(btf, BTF_FASTCALL_TAG, target->type_id, kfunc->name);
 		if (err < 0)
 			return err;
 	}
@@ -1876,11 +1885,10 @@ static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *
 	return 0;
 }
 
-static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
+static int btf_encoder__collect_kfunc_infos(struct btf_encoder *encoder)
 {
 	const char *filename = encoder->source_filename;
 	struct gobuffer btf_kfunc_ranges = {};
-	struct gobuffer btf_funcs = {};
 	Elf_Data *symbols = NULL;
 	Elf_Data *idlist = NULL;
 	Elf_Scn *symscn = NULL;
@@ -1896,6 +1904,8 @@ static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
 	char *secname;
 	int nr_syms;
 	int i = 0;
+
+	INIT_LIST_HEAD(&encoder->kfuncs);
 
 	fd = open(filename, O_RDONLY);
 	if (fd < 0) {
@@ -1977,12 +1987,6 @@ static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
 	}
 	nr_syms = shdr.sh_size / shdr.sh_entsize;
 
-	err = btf_encoder__collect_btf_funcs(encoder, &btf_funcs);
-	if (err) {
-		fprintf(stderr, "%s: failed to collect BTF funcs\n", __func__);
-		goto out;
-	}
-
 	/* First collect all kfunc set ranges.
 	 *
 	 * Note we choose not to sort these ranges and accept a linear
@@ -2020,7 +2024,6 @@ static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
 		ptrdiff_t off;
 		GElf_Sym sym;
 		bool found;
-		int err;
 		int j;
 
 		if (!gelf_getsym(symbols, i, &sym)) {
@@ -2061,23 +2064,54 @@ static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
 			continue;
 		}
 
-		err = btf_encoder__tag_kfunc(encoder, &btf_funcs, func, pair->flags);
-		if (err) {
-			fprintf(stderr, "%s: failed to tag kfunc '%s'\n", __func__, func);
-			free(func);
+		struct kfunc_info *info = malloc(sizeof(*info));
+		if (!info) {
+			fprintf(stderr, "%s: failed to allocate memory for kfunc info\n", __func__);
+			err = -ENOMEM;
 			goto out;
 		}
-		free(func);
+		info->id = pair->id;
+		info->flags = pair->flags;
+		info->name = func;
+		list_add(&info->node, &encoder->kfuncs);
 	}
 
 	err = 0;
 out:
-	__gobuffer__delete(&btf_funcs);
 	__gobuffer__delete(&btf_kfunc_ranges);
 	if (elf)
 		elf_end(elf);
 	if (fd != -1)
 		close(fd);
+	return err;
+}
+
+static int btf_encoder__tag_kfuncs(struct btf_encoder *encoder)
+{
+	struct gobuffer btf_funcs = {};
+	int err;
+
+	err = btf_encoder__collect_btf_funcs(encoder, &btf_funcs);
+	if (err) {
+		fprintf(stderr, "%s: failed to collect BTF funcs\n", __func__);
+		goto out;
+	}
+
+	struct kfunc_info *kfunc, *tmp;
+	list_for_each_entry_safe(kfunc, tmp, &encoder->kfuncs, node) {
+		err = btf_encoder__tag_kfunc(encoder, &btf_funcs, kfunc);
+		if (err) {
+			fprintf(stderr, "%s: failed to tag kfunc '%s'\n", __func__, kfunc->name);
+			goto out;
+		}
+		list_del(&kfunc->node);
+		free(kfunc->name);
+		free(kfunc);
+	}
+
+	err = 0;
+out:
+	__gobuffer__delete(&btf_funcs);
 	return err;
 }
 
@@ -2496,6 +2530,11 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		if (!found_percpu && encoder->verbose)
 			printf("%s: '%s' doesn't have '%s' section\n", __func__, cu->filename, PERCPU_SECTION);
 
+
+		if (encoder->tag_kfuncs) {
+			if (btf_encoder__collect_kfunc_infos(encoder))
+				goto out_delete;
+		}
 		if (encoder->verbose)
 			printf("File %s:\n", cu->filename);
 	}
