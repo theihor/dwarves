@@ -39,8 +39,13 @@
 #define BTF_ID_SET8_PFX		"__BTF_ID__set8__"
 #define BTF_SET8_KFUNCS		(1 << 0)
 #define BTF_KFUNC_TYPE_TAG	"bpf_kfunc"
-#define BTF_FASTCALL_TAG       "bpf_fastcall"
-#define KF_FASTCALL            (1 << 12)
+#define BTF_FASTCALL_TAG    "bpf_fastcall"
+#define BTF_ARENA_TAG       "bpf_arena"
+
+/* kfunc flags */
+#define KF_FASTCALL   (1 << 12)
+#define KF_ARENA_RET  (1 << 13)
+#define KF_ARENA_ARG2 (1 << 14)
 
 struct btf_id_and_flag {
 	uint32_t id;
@@ -88,6 +93,8 @@ struct btf_encoder_func_state {
 struct elf_function {
 	const char	*name;
 	char		*alias;
+	uint8_t		generated:1;
+	uint8_t		kfunc:1;
 	size_t		prefixlen;
 };
 
@@ -742,8 +749,78 @@ static int32_t btf_encoder__tag_type(struct btf_encoder *encoder, uint32_t tag_t
 	return encoder->type_id_off + tag_type;
 }
 
-static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct ftype *ftype,
-					   struct btf_encoder_func_state *state)
+static inline struct kfunc_info* btf_encoder__kfunc_info_by_name(struct btf_encoder *encoder, const char *name) {
+	struct kfunc_info *kfunc;
+
+	list_for_each_entry(kfunc, &encoder->kfuncs, node) {
+		if (strcmp(kfunc->name, name) == 0)
+			return kfunc;
+	}
+	return NULL;
+}
+
+static inline int btf_encoder__tag_bpf_arena(struct btf *btf, int type_id)
+{
+	const struct btf_type *ptr;
+	int tagged_type_id;
+
+	ptr = btf__type_by_id(btf, type_id);
+	assert(btf_is_ptr(ptr));
+
+	tagged_type_id = btf__add_type_tag(btf, BTF_ARENA_TAG, ptr->type);
+	if (tagged_type_id < 0)
+		return tagged_type_id;
+
+	return btf__add_ptr(btf, tagged_type_id);
+}
+
+static int btf_encoder__add_bpf_arena_type_tags(struct btf_encoder *encoder, struct btf_encoder_func_state *state)
+{
+	struct kfunc_info *kfunc = NULL;
+	int ret_type_id, parm_type_id;
+	int err = 0;
+
+	if (!state->elf || !state->elf->kfunc)
+		goto out;
+
+	kfunc = btf_encoder__kfunc_info_by_name(encoder, state->elf->name);
+	if (!kfunc)
+		goto out;
+
+	if (KF_ARENA_RET & kfunc->flags) {
+		ret_type_id = btf_encoder__tag_bpf_arena(encoder->btf, state->ret_type_id);
+		if (ret_type_id < 0) {
+			btf__log_err(encoder->btf, BTF_KIND_TYPE_TAG, BTF_ARENA_TAG, true, ret_type_id,
+				"Error adding BTF_ARENA_TAG for kfunc '%s'", kfunc->name);
+			err = ret_type_id;
+			goto out;
+		}
+		state->ret_type_id = ret_type_id;
+	}
+
+	if (KF_ARENA_ARG2 & kfunc->flags) {
+		assert(state->nr_parms > 1);
+		parm_type_id = btf_encoder__tag_bpf_arena(encoder->btf, state->parms[1].type_id);
+		if (parm_type_id < 0) {
+			btf__log_err(encoder->btf, BTF_KIND_TYPE_TAG, BTF_ARENA_TAG, true, parm_type_id,
+				"Error adding BTF_ARENA_TAG for an argument of kfunc '%s'", kfunc->name);
+			err = parm_type_id;
+			goto out;
+		}
+		state->parms[1].type_id = parm_type_id;
+	}
+out:
+	return err;
+}
+
+static inline bool is_kfunc_state(struct btf_encoder_func_state *state)
+{
+	return state && state->elf && state->elf->kfunc;
+}
+
+static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder,
+										struct ftype *ftype,
+										struct btf_encoder_func_state *state)
 {
 	const struct btf_type *t;
 	struct btf *btf;
@@ -769,6 +846,11 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 		return 0;
 	}
 
+	if (is_kfunc_state(state)) {
+		if (btf_encoder__add_bpf_arena_type_tags(encoder, state) < 0)
+			return -1;
+	}
+
 	id = btf__add_func_proto(btf, type_id);
 	if (id > 0) {
 		t = btf__type_by_id(btf, id);
@@ -784,7 +866,7 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 	param_idx = 0;
 	if (ftype) {
 		ftype__for_each_parameter(ftype, param) {
-			const char *name = parameter__name(param);
+			name = parameter__name(param);
 
 			type_id = param->tag.type == 0 ? 0 : encoder->type_id_off + param->tag.type;
 			++param_idx;
@@ -1885,7 +1967,7 @@ static int btf_encoder__tag_kfunc(struct btf_encoder *encoder, struct gobuffer *
 	return 0;
 }
 
-static int btf_encoder__collect_kfunc_infos(struct btf_encoder *encoder)
+static int btf_encoder__collect_kfuncs(struct btf_encoder *encoder)
 {
 	const char *filename = encoder->source_filename;
 	struct gobuffer btf_kfunc_ranges = {};
@@ -2019,6 +2101,8 @@ static int btf_encoder__collect_kfunc_infos(struct btf_encoder *encoder)
 	for (i = 0; i < nr_syms; i++) {
 		const struct btf_kfunc_set_range *ranges;
 		const struct btf_id_and_flag *pair;
+		struct elf_function *elf_fn;
+		struct kfunc_info *kfunc;
 		unsigned int ranges_cnt;
 		char *func, *name;
 		ptrdiff_t off;
@@ -2064,16 +2148,20 @@ static int btf_encoder__collect_kfunc_infos(struct btf_encoder *encoder)
 			continue;
 		}
 
-		struct kfunc_info *info = malloc(sizeof(*info));
-		if (!info) {
+		kfunc = calloc(1, sizeof(*kfunc));
+		if (!kfunc) {
 			fprintf(stderr, "%s: failed to allocate memory for kfunc info\n", __func__);
 			err = -ENOMEM;
 			goto out;
 		}
-		info->id = pair->id;
-		info->flags = pair->flags;
-		info->name = func;
-		list_add(&info->node, &encoder->kfuncs);
+		kfunc->id = pair->id;
+		kfunc->flags = pair->flags;
+		kfunc->name = func;
+		list_add(&kfunc->node, &encoder->kfuncs);
+
+		elf_fn = btf_encoder__find_function(encoder, kfunc->name, 0);
+		assert(elf_fn);
+		elf_fn->kfunc = true;
 	}
 
 	err = 0;
@@ -2530,11 +2618,11 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		if (!found_percpu && encoder->verbose)
 			printf("%s: '%s' doesn't have '%s' section\n", __func__, cu->filename, PERCPU_SECTION);
 
-
 		if (encoder->tag_kfuncs) {
-			if (btf_encoder__collect_kfunc_infos(encoder))
+			if (btf_encoder__collect_kfuncs(encoder))
 				goto out_delete;
 		}
+
 		if (encoder->verbose)
 			printf("File %s:\n", cu->filename);
 	}
