@@ -40,7 +40,8 @@
 #define BTF_SET8_KFUNCS		(1 << 0)
 #define BTF_KFUNC_TYPE_TAG	"bpf_kfunc"
 #define BTF_FASTCALL_TAG    "bpf_fastcall"
-#define BTF_ARENA_TAG       "bpf_arena"
+
+#define BPF_ARENA_ATTR      "address_space(1)"
 
 /* kfunc flags */
 #define KF_FASTCALL   (1 << 12)
@@ -767,7 +768,7 @@ static inline int btf_encoder__tag_bpf_arena(struct btf *btf, int type_id)
 	ptr = btf__type_by_id(btf, type_id);
 	assert(btf_is_ptr(ptr));
 
-	tagged_type_id = btf__add_type_tag(btf, BTF_ARENA_TAG, ptr->type);
+	tagged_type_id = btf__add_type_tag_attr(btf, BPF_ARENA_ATTR, ptr->type);
 	if (tagged_type_id < 0)
 		return tagged_type_id;
 
@@ -790,8 +791,8 @@ static int btf_encoder__add_bpf_arena_type_tags(struct btf_encoder *encoder, str
 	if (KF_ARENA_RET & kfunc->flags) {
 		ret_type_id = btf_encoder__tag_bpf_arena(encoder->btf, state->ret_type_id);
 		if (ret_type_id < 0) {
-			btf__log_err(encoder->btf, BTF_KIND_TYPE_TAG, BTF_ARENA_TAG, true, ret_type_id,
-				"Error adding BTF_ARENA_TAG for kfunc '%s'", kfunc->name);
+			btf__log_err(encoder->btf, BTF_KIND_TYPE_TAG, BPF_ARENA_ATTR, true, ret_type_id,
+				"Error adding BPF_ARENA_ATTR for kfunc '%s'", kfunc->name);
 			err = ret_type_id;
 			goto out;
 		}
@@ -802,8 +803,8 @@ static int btf_encoder__add_bpf_arena_type_tags(struct btf_encoder *encoder, str
 		assert(state->nr_parms > 1);
 		parm_type_id = btf_encoder__tag_bpf_arena(encoder->btf, state->parms[1].type_id);
 		if (parm_type_id < 0) {
-			btf__log_err(encoder->btf, BTF_KIND_TYPE_TAG, BTF_ARENA_TAG, true, parm_type_id,
-				"Error adding BTF_ARENA_TAG for an argument of kfunc '%s'", kfunc->name);
+			btf__log_err(encoder->btf, BTF_KIND_TYPE_TAG, BPF_ARENA_ATTR, true, parm_type_id,
+				"Error adding BPF_ARENA_ATTR for an argument of kfunc '%s'", kfunc->name);
 			err = parm_type_id;
 			goto out;
 		}
