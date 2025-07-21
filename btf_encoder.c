@@ -94,9 +94,10 @@ struct btf_encoder_func_state {
 
 struct elf_function {
 	const char	*name;
-	char		*alias;
-	size_t		prefixlen;
-	bool		kfunc;
+	const char	*alias;
+	int prefixlen;
+	uint8_t        	is_static:1;
+	uint8_t		kfunc:1;
 	uint32_t	kfunc_flags;
 };
 
@@ -161,10 +162,18 @@ struct btf_kfunc_set_range {
 	uint64_t end;
 };
 
+static inline int elf_function__has_alias(const struct elf_function *func) {
+	return func->name != func->alias;
+}
+
 static inline void elf_functions__delete(struct elf_functions *funcs)
 {
-	for (int i = 0; i < funcs->cnt; i++)
-		free(funcs->entries[i].alias);
+	struct elf_function *func;
+	for (int i = 0; i < funcs->cnt; i++) {
+		func = &funcs->entries[i];
+		if (elf_function__has_alias(func))
+			free((char *)func->alias);
+	}
 	free(funcs->entries);
 	elf_symtab__delete(funcs->symtab);
 	list_del(&funcs->node);
@@ -1295,6 +1304,8 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 
 	btf_fnproto_id = btf_encoder__add_func_proto(encoder, NULL, state);
 	name = func->alias ?: func->name;
+	if (!strcmp(name, "bpf_cgroup_ancestor"))
+		printf("%s\n", func->name);
 	if (btf_fnproto_id >= 0)
 		btf_fn_id = btf_encoder__add_ref_type(encoder, BTF_KIND_FUNC, btf_fnproto_id,
 						      name, false);
@@ -1305,6 +1316,7 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 	}
 
 	if (func->kfunc && encoder->tag_kfuncs && !encoder->skip_encoding_decl_tag) {
+
 		err = btf__tag_kfunc(encoder->btf, func, btf_fn_id);
 		if (err < 0)
 			return err;
@@ -1338,29 +1350,24 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 	return 0;
 }
 
-static int functions_cmp(const void *_a, const void *_b)
+#ifndef max
+#define max(x, y) ((x) < (y) ? (y) : (x))
+#endif
+
+static int elf_function__alias_cmp(const void *_a, const void *_b)
 {
 	const struct elf_function *a = _a;
 	const struct elf_function *b = _b;
 
-	/* if search key allows prefix match, verify target has matching
-	 * prefix len and prefix matches.
-	 */
-	if (a->prefixlen && a->prefixlen == b->prefixlen)
-		return strncmp(a->name, b->name, b->prefixlen);
-	return strcmp(a->name, b->name);
+	return strcmp(a->alias, b->alias);
 }
-
-#ifndef max
-#define max(x, y) ((x) < (y) ? (y) : (x))
-#endif
 
 static int saved_functions_cmp(const void *_a, const void *_b)
 {
 	const struct btf_encoder_func_state *a = _a;
 	const struct btf_encoder_func_state *b = _b;
 
-	return functions_cmp(a->elf, b->elf);
+	return elf_function__alias_cmp(a->elf, b->elf);
 }
 
 static int saved_functions_combine(struct btf_encoder_func_state *a, struct btf_encoder_func_state *b)
@@ -1368,13 +1375,17 @@ static int saved_functions_combine(struct btf_encoder_func_state *a, struct btf_
 	uint8_t optimized, unexpected, inconsistent;
 	int ret;
 
+	// if (!strcmp(a->elf->name, "t_next")) {
+	// 	fprintf(stdout, "%s\n", a->elf->name);
+	// }
+
 	ret = strncmp(a->elf->name, b->elf->name,
 		      max(a->elf->prefixlen, b->elf->prefixlen));
 	if (ret != 0)
 		return ret;
 	optimized = a->optimized_parms | b->optimized_parms;
 	unexpected = a->unexpected_reg | b->unexpected_reg;
-	inconsistent = a->inconsistent_proto | b->inconsistent_proto;
+	inconsistent = a->inconsistent_proto | b->inconsistent_proto | a->elf->is_static | b->elf->is_static;
 	if (!unexpected && !inconsistent && !funcs__match(a, b))
 		inconsistent = 1;
 	a->optimized_parms = b->optimized_parms = optimized;
@@ -1447,6 +1458,10 @@ out:
 	return err;
 }
 
+// static bool is_elf_func_name_collectable(const char *name) {
+
+// }
+
 static void elf_functions__collect_function(struct elf_functions *functions, GElf_Sym *sym)
 {
 	struct elf_function *func;
@@ -1459,15 +1474,23 @@ static void elf_functions__collect_function(struct elf_functions *functions, GEl
 	if (!name)
 		return;
 
+	// if (!strcmp(name, "bpf_cgroup_ancestor"))
+	// printf("%s\n", name);
+
 	func = &functions->entries[functions->cnt];
 	func->name = name;
+	// func->is_static = elf_sym__bind(sym) == STB_LOCAL;
+
 	if (strchr(name, '.')) {
 		const char *suffix = strchr(name, '.');
 
 		functions->suffix_cnt++;
 		func->prefixlen = suffix - name;
+		
+		func->alias = strndup(name, func->prefixlen);
 	} else {
 		func->prefixlen = strlen(name);
+		func->alias = name;
 	}
 
 	functions->cnt++;
@@ -1490,13 +1513,12 @@ static struct elf_functions *btf_encoder__elf_functions(struct btf_encoder *enco
 	return funcs;
 }
 
-static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder,
-						       const char *name, size_t prefixlen)
+static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder, const char *alias)
 {
 	struct elf_functions *funcs = elf_functions__find(encoder->cu->elf, &encoder->elf_functions_list);
-	struct elf_function key = { .name = name, .prefixlen = prefixlen };
+	struct elf_function key = { .alias = alias };
 
-	return bsearch(&key, funcs->entries, funcs->cnt, sizeof(key), functions_cmp);
+	return bsearch(&key, funcs->entries, funcs->cnt, sizeof(key), elf_function__alias_cmp);
 }
 
 static bool btf_name_char_ok(char c, bool first)
@@ -2031,9 +2053,13 @@ static int btf_encoder__collect_kfuncs(struct btf_encoder *encoder)
 			continue;
 
 		name = elf_strptr(elf, strtabidx, sym.st_name);
+		
 		func = get_func_name(name);
 		if (!func)
 			continue;
+
+		if (!strcmp(func, "bpf_cgroup_ancestor") || !strcmp(name, "bpf_cgroup_ancestor"))
+			printf("%s -> %s\n", name, func);
 
 		/* Check if function belongs to a kfunc set */
 		ranges = gobuffer__entries(&btf_kfunc_ranges);
@@ -2060,8 +2086,8 @@ static int btf_encoder__collect_kfuncs(struct btf_encoder *encoder)
 			continue;
 		}
 
-		elf_fn = btf_encoder__find_function(encoder, func, 0);
-		if (elf_fn) {
+		elf_fn = btf_encoder__find_function(encoder, func);
+		if (elf_fn && !elf_function__has_alias(elf_fn)) {
 			elf_fn->kfunc = true;
 			elf_fn->kfunc_flags = pair->flags;
 		}
@@ -2159,7 +2185,7 @@ static int elf_functions__collect(struct elf_functions *functions)
 	}
 
 	if (functions->cnt) {
-		qsort(functions->entries, functions->cnt, sizeof(*functions->entries), functions_cmp);
+		qsort(functions->entries, functions->cnt, sizeof(*functions->entries), elf_function__alias_cmp);
 	} else {
 		err = 0;
 		goto out_free;
@@ -2173,6 +2199,10 @@ static int elf_functions__collect(struct elf_functions *functions)
 		fprintf(stderr, "could not reallocate memory for elf_functions table\n");
 		err = -ENOMEM;
 		goto out_free;
+	}
+
+	for (int i = 0; i < functions->cnt; i++) {
+		printf("%s\n", functions->entries[i].name);
 	}
 
 	return 0;
@@ -2661,30 +2691,29 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			if (!name)
 				continue;
 
-			/* prefer exact function name match... */
-			func = btf_encoder__find_function(encoder, name, 0);
-			if (!func && funcs->suffix_cnt &&
-			    conf_load->btf_gen_optimized) {
-				/* falling back to name.isra.0 match if no exact
-				 * match is found; only bother if we found any
-				 * .suffix function names.  The function
-				 * will be saved and added once we ensure
-				 * it does not have optimized-out parameters
-				 * in any cu.
-				 */
-				func = btf_encoder__find_function(encoder, name,
-								  strlen(name));
-				if (func) {
-					if (encoder->verbose)
-						printf("matched function '%s' with '%s'%s\n",
-						       name, func->name,
-						       fn->proto.optimized_parms ?
-						       ", has optimized-out parameters" :
-						       fn->proto.unexpected_reg ? ", has unexpected register use by params" :
-						       "");
-					if (!func->alias)
-						func->alias = strdup(name);
-				}
+			if (!strcmp(name, "bpf_cgroup_ancestor"))
+				printf("%s\n", name);
+
+			func = btf_encoder__find_function(encoder, name);
+			if (!func) {
+				if (encoder->verbose)
+					printf("could not find function '%s' in the ELF functions table\n", name);
+				continue;
+			}
+
+			/* Check if this was not an exact match, but a match by prefix.
+			 * If yes, the func should be added to BTF only if btf_gen_optimized is set
+			 */
+			if (elf_function__has_alias(func)) {
+				if (!conf_load->btf_gen_optimized)
+					func = NULL;
+				else if (encoder->verbose)
+					printf("matched function '%s' with '%s'%s\n",
+						name, func->name,
+						fn->proto.optimized_parms ?
+						", has optimized-out parameters" :
+						fn->proto.unexpected_reg ? ", has unexpected register use by params" :
+						"");
 			}
 		} else {
 			if (!fn->external)
