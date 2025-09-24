@@ -48,6 +48,7 @@
 #define KF_ARENA_RET  (1 << 13)
 #define KF_ARENA_ARG1 (1 << 14)
 #define KF_ARENA_ARG2 (1 << 15)
+#define KF_IMPLICIT_PROG_AUX_ARG (1 << 16)
 
 struct btf_id_and_flag {
 	uint32_t id;
@@ -868,6 +869,41 @@ static int32_t btf_encoder__add_func_proto_for_ftype(struct btf_encoder *encoder
 	return id;
 }
 
+static const struct btf_type *btf__unqualified_type_by_id(const struct btf *btf, int32_t type_id)
+{
+	const struct btf_type *t = btf__type_by_id(btf, type_id);
+	while (btf_is_const(t) || btf_is_volatile(t) || btf_is_restrict(t)) {
+		t = btf__type_by_id(btf, t->type);
+	}
+	return t;
+}
+
+static int validate_kfunc_with_implicit_prog_aux_arg(struct btf_encoder_func_state *state)
+{
+	/* The last argument must be a pointer to 'struct bpf_prog_aux' */
+	const struct btf_encoder_func_parm *p = &state->parms[state->nr_parms - 1];
+	const struct btf *btf = state->encoder->btf;
+	const struct btf_type *t = btf__unqualified_type_by_id(btf, p->type_id);
+	if (!btf_is_ptr(t))
+		goto out_err;
+
+	const uint32_t struct_type_id = t->type;
+	t = btf__unqualified_type_by_id(btf, struct_type_id);
+	if (!btf_is_struct(t))
+		goto out_err;
+
+	const char *name = btf__name_by_offset(btf, t->name_off);
+	if (strcmp(name, "bpf_prog_aux") != 0)
+		goto out_err;
+
+	return 0;
+out_err:
+	btf__log_err(btf, BTF_KIND_FUNC_PROTO, state->elf->name, true, 0,
+		"return=%u Error emitting BTF func proto for kfunc with implicit bpf_prog_aux: the last parameter is not 'struct bpf_prog_aux*'",
+		p->type_id);
+	return -1;
+}
+
 static int32_t btf_encoder__add_func_proto_for_state(struct btf_encoder *encoder, struct btf_encoder_func_state *state)
 {
 	uint16_t nr_params, param_idx;
@@ -886,6 +922,12 @@ static int32_t btf_encoder__add_func_proto_for_state(struct btf_encoder *encoder
 	btf = state->encoder->btf;
 	nr_params = state->nr_parms;
 	type_id = state->ret_type_id;
+
+	if (is_kfunc_state(state) && KF_IMPLICIT_PROG_AUX_ARG & state->elf->kfunc_flags) {
+		if (validate_kfunc_with_implicit_prog_aux_arg(state))
+			return -1;
+		nr_params--;
+	}
 
 	id = btf_encoder__emit_func_proto(encoder, type_id, nr_params);
 	if (id < 0)
