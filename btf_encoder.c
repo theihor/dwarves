@@ -48,6 +48,7 @@
 #define KF_ARENA_RET  (1 << 13)
 #define KF_ARENA_ARG1 (1 << 14)
 #define KF_ARENA_ARG2 (1 << 15)
+#define KF_MAGIC_ARGS (1 << 16)
 
 struct btf_id_and_flag {
 	uint32_t id;
@@ -869,6 +870,81 @@ static int32_t btf_encoder__add_func_proto_for_ftype(struct btf_encoder *encoder
 	return id;
 }
 
+static const struct btf_type *btf__unqualified_type_by_id(const struct btf *btf, int32_t type_id)
+{
+	const struct btf_type *t = btf__type_by_id(btf, type_id);
+	while (btf_is_const(t) || btf_is_volatile(t) || btf_is_restrict(t)) {
+		t = btf__type_by_id(btf, t->type);
+	}
+	return t;
+}
+
+static bool btf__is_kf_magic_arg(const struct btf *btf, const struct btf_encoder_func_parm *p) {
+	static const char *magic_types[] = {
+		"bpf_prog_aux",
+		"btf_struct_meta",
+	};
+
+	/*
+	 * Magic arguments are pointers to 'struct <magic_type>'
+	 * Type modifiers (e.g. 'const') are disregarded.
+	 */
+	const struct btf_type *t;
+	const char *name;
+	int i;
+
+	t = btf__unqualified_type_by_id(btf, p->type_id);
+	name = btf__name_by_offset(btf, t->name_off);
+	if (!btf_is_ptr(t))
+		return false;
+
+	t = btf__unqualified_type_by_id(btf, t->type);
+	name = btf__name_by_offset(btf, t->name_off);
+	if (!btf_is_struct(t))
+		return false;
+
+	name = btf__name_by_offset(btf, t->name_off);
+	for (i = 0; i < ARRAY_SIZE(magic_types); i++) {
+		if (strcmp(name, magic_types[i]) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * A kfunc with KF_MAGIC_ARGS flag has some number of arguments set implicitly by the BPF verifier.
+ * Such arguments can only be of certain pre-defined types. process_kfunc_magic_args() checks the
+ * BTF types of the arguments from last to first, and returns the number of magic arguments.
+ * Note that *all* magic arguments must come after *all* normal arguments in the function signature.
+ * If this assumption is violated, process_kfunc_magic_args() returns a negative number (an error).
+ */
+static int process_kfunc_magic_args(struct btf_encoder_func_state *state)
+{
+	const struct btf *btf = state->encoder->btf;
+	const struct btf_encoder_func_parm *p;
+	int cnt = 0, i;
+
+	for (i = state->nr_parms - 1; i >= 0; i--) {
+		p = &state->parms[i];
+		if (btf__is_kf_magic_arg(btf, p)) {
+			cnt++;
+			if (cnt != state->nr_parms - i)
+				goto out_err;
+		} else if (cnt == 0) {
+			goto out_err;
+		}
+	}
+
+	return cnt;
+
+out_err:
+	btf__log_err(btf, BTF_KIND_FUNC_PROTO, state->elf->name, true, 0,
+		     "return=%u Error emitting BTF func proto for KF_MAGIC_ARGS kfunc: unexpected kfunc signature",
+		     p->type_id);
+	return -1;
+}
+
 static int32_t btf_encoder__add_func_proto_for_state(struct btf_encoder *encoder, struct btf_encoder_func_state *state)
 {
 	uint16_t nr_params, param_idx;
@@ -1396,11 +1472,11 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 		return -1;
 	}
 
-	return 0;
+	return btf_fn_id;
 }
 
-static int btf_encoder__add_bpf_kfunc(struct btf_encoder *encoder,
-				      struct btf_encoder_func_state *state)
+static int btf_encoder__add_bpf_kfunc_instance(struct btf_encoder *encoder,
+				      	       struct btf_encoder_func_state *state)
 {
 	int btf_fn_id, err;
 
@@ -1420,6 +1496,60 @@ static int btf_encoder__add_bpf_kfunc(struct btf_encoder *encoder,
 
 	return 0;
 }
+
+#define BPF_KFUNC_IMPL_SUFFIX "_impl"
+
+static int btf_encoder__add_bpf_kfunc(struct btf_encoder *encoder,
+				      struct btf_encoder_func_state *state)
+{
+	uint32_t flags = state->elf->kfunc_flags;
+	int err;
+
+	/*
+	 * For KF_MAGIC_ARGS kfuncs we emit two BTF functions (and protos):
+	 *   - bpf_foo_impl(<original kernel args>)
+	 *   - bpf_foo(<bpf args w/o magic args>)
+	 * We achieve this by creating a temporary btf_encoder_func_state-s
+	 */
+	if (KF_MAGIC_ARGS & flags) {
+		struct btf_encoder_func_state tmp_state = *state;
+		struct elf_function tmp_elf = *state->elf;
+		char tmp_name[KSYM_NAME_LEN];
+
+		/* First, add kfunc_impl(), modifying only the name */
+		strcpy(tmp_name, state->elf->name);
+		strcat(tmp_name, BPF_KFUNC_IMPL_SUFFIX);
+		tmp_elf.name = tmp_name;
+		tmp_state.elf = &tmp_elf;
+		err = btf_encoder__add_bpf_kfunc_instance(encoder, &tmp_state);
+		if (err < 0)
+			return -1;
+
+		/* Then add kfunc() with omitted magic arguments */
+		int nr_magic_args = process_kfunc_magic_args(state);
+		if (nr_magic_args <= 0)
+			return -1;
+		tmp_state.elf = state->elf;
+		tmp_state.nr_parms -= nr_magic_args;
+
+		struct btf_encoder_func_annot tmp_annots[state->nr_annots];
+		int j = 0;
+		for (int i = 0; i < state->nr_annots; i++) {
+			if (state->annots[i].component_idx < tmp_state.nr_parms)
+				tmp_annots[j++] = state->annots[i];
+		}
+		tmp_state.nr_annots = j;
+		tmp_state.annots = tmp_annots;
+		err = btf_encoder__add_bpf_kfunc_instance(encoder, &tmp_state);
+		if (err < 0)
+			return -1;
+
+		return 0;
+	}
+
+	return btf_encoder__add_bpf_kfunc_instance(encoder, state);
+}
+
 
 static int elf_function__name_cmp(const void *_a, const void *_b)
 {
